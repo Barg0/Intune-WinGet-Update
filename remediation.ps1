@@ -15,14 +15,15 @@ $blacklistApps = @(
     'Microsoft.WindowsTerminal',
     'Adobe.Acrobat.Reader.32-bit',
     'Adobe.Acrobat.Reader.64-bit',
-    'Microsoft.PowerShell'
+    'Microsoft.PowerShell',
+    'Lenovo.SUHelper'
 )
 
 # ---------------------------[ Script Start Timestamp ]---------------------------
 $scriptStartTime = Get-Date
 
 # ---------------------------[ Script Name ]---------------------------
-$scriptName  = "Winget-AppUpdate-Blacklist"
+$scriptName  = "Winget-AppUpdate"
 $logFileName = "remediation.log"
 
 # ---------------------------[ Logging Setup ]---------------------------
@@ -115,35 +116,69 @@ Write-Log "======== Script Started ========" -Tag "Start"
 Write-Log "ComputerName: $env:COMPUTERNAME | User: $env:USERNAME | Script: $scriptName" -Tag "Info"
 
 # ---------------------------[ Winget Path Resolver ]---------------------------
+# Resolves winget.exe path handling:
+# - Multiple install folders (e.g. after updates: 1.21.x and 1.22.x both present)
+# - Architecture: prefers x64, then arm64 (avoids ambiguity on ARM64 devices)
+# - ProgramW6432: correct 64-bit WindowsApps path even when script runs in 32-bit context
 function Get-WingetPath {
     [CmdletBinding()]
     param()
-    
-    # WAU approach: Use Get-Item with wildcard and sort by FileVersionRaw
-    $systemPath = "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_8wekyb3d8bbwe\winget.exe"
-    
-    try {
-        # Try system context first (newest version) - matches WAU Get-WingetCmd
-        $WingetInfo = (Get-Item $systemPath -ErrorAction Stop).VersionInfo |
-            Sort-Object FileVersionRaw -Descending |
-            Select-Object -First 1
 
-        if ($WingetInfo.FileName) {
-            return $WingetInfo.FileName
+    $wingetBase = "$env:ProgramW6432\WindowsApps"
+    $patterns   = @(
+        'Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe'
+        'Microsoft.DesktopAppInstaller_*_arm64__8wekyb3d8bbwe'
+    )
+
+    try {
+        foreach ($pattern in $patterns) {
+            $wingetFolders = Get-ChildItem -Path $wingetBase -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like $pattern }
+
+            if (-not $wingetFolders) { continue }
+
+            # Multiple folders possible (e.g. old + new version). Pick newest by file version, then CreationTime.
+            $candidates = foreach ($folder in $wingetFolders) {
+                $exePath = Join-Path $folder.FullName 'winget.exe'
+                if (-not (Test-Path -LiteralPath $exePath)) { continue }
+                try {
+                    $ver = (Get-Item -LiteralPath $exePath -ErrorAction Stop).VersionInfo.FileVersionRaw
+                } catch {
+                    $ver = $null
+                }
+                [PSCustomObject]@{
+                    Path         = $exePath
+                    FileVersion  = $ver
+                    CreationTime = $folder.CreationTime
+                }
+            }
+
+            if (-not $candidates) { continue }
+
+            $latest = $candidates |
+                Sort-Object { $_.FileVersion }, CreationTime -Descending |
+                Select-Object -First 1
+
+            if ($latest.Path) {
+                return $latest.Path
+            }
         }
-    }
-    catch {
-        # System context not found, try user context (WAU fallback)
+
+        # Fallback: user context (e.g. winget installed per-user)
         $userPath = "$env:LocalAppData\Microsoft\WindowsApps\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\winget.exe"
-        if (Test-Path $userPath) {
+        if (Test-Path -LiteralPath $userPath) {
             return $userPath
         }
-        
-        Write-Log "Failed to detect Winget installation: $_" -Tag "Error"
+
+        Write-Log "Failed to detect Winget installation: no x64/arm64 folder or winget.exe found." -Tag "Error"
         throw "Winget not found in system or user context"
     }
-    
-    throw "Winget not found"
+    catch {
+        if ($_.Exception.Message -notlike 'Winget not found*') {
+            Write-Log "Failed to detect Winget installation: $_" -Tag "Error"
+        }
+        throw "Winget not found in system or user context"
+    }
 }
 
 # ---------------------------[ Test Winget Function ]---------------------------
