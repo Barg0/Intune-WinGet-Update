@@ -1,7 +1,11 @@
 # ---------------------------[ Config ]---------------------------
+# ListMode: 'Blacklist' = update all except listed apps; 'Whitelist' = update only listed apps
+$listMode = 'Blacklist'
+
+# Blacklist: apps EXCLUDED from updates (used when listMode = 'Blacklist')
 $blacklistApps = @(
     'Microsoft.Edge*',
-    'Microsoft.Teams*',    
+    'Microsoft.Teams*',
     'Microsoft.Office',
     'Microsoft.OneDrive',
     'Microsoft.AppInstaller',
@@ -19,23 +23,113 @@ $blacklistApps = @(
     'Lenovo.SUHelper'
 )
 
+# Whitelist: apps INCLUDED in updates (used when listMode = 'Whitelist'). Wildcards supported.
+$whitelistApps = @(
+    '7zip.7zip',
+    'Google.Chrome',
+    'Microsoft.DotNet*',
+    'Microsoft.VCRedist*',
+    'Notepad++.Notepad++'
+)
+
 # ---------------------------[ Script Start Timestamp ]---------------------------
 $scriptStartTime = Get-Date
 
 # ---------------------------[ Script Name ]---------------------------
-$scriptName  = "Winget-AppUpdate"
+$scriptName  = 'Winget-AppUpdate'
 $logFileName = "remediation.log"
 
 # ---------------------------[ Logging Setup ]---------------------------
-# Logging configuration
 $log           = $true
-$logDebug      = $true    # Set to $true for verbose DEBUG logging
-$logGet        = $true    # enable/disable all [Get] logs
-$logRun        = $true    # enable/disable all [Run] logs
+$logDebug      = $true
+$logGet        = $true
+$logRun        = $true
 $enableLogFile = $true
 
 $logFileDirectory = "$env:ProgramData\IntuneLogs\Scripts\$scriptName"
 $logFile          = "$logFileDirectory\$logFileName"
+
+# ---------------------------[ Winget Exit Code Map ]---------------------------
+# Only codes that can realistically fire during winget upgrade / install.
+# Sources:
+#   https://kb.filewave.com/books/microsoft-windows-package-manager-winget/page/troubleshooting-errors-with-winget
+#   https://github.com/microsoft/winget-cli/blob/master/doc/windows/package-manager/winget/returnCodes.md
+#
+# Categories drive the retry engine:
+#   Success    - Desired state reached. No action needed.
+#   RetryScope - No applicable installer for scope; retry with --scope user (if user-scoped app).
+#   RetryLater - Transient (app in use, disk full, reboot, network). Defer to next Intune cycle.
+#   Fail       - Unrecoverable in automation (policy block, hash mismatch, unsupported).
+function Get-WingetExitCodeInfo {
+    [CmdletBinding()]
+    param([int]$ExitCode)
+    $codeMap = @{
+        # ── Success ──
+        0              = @{ Category = 'Success';    Description = 'Success' }
+        3010           = @{ Category = 'Success';    Description = 'Success (reboot required to complete)' }              # MSI ERROR_SUCCESS_REBOOT_REQUIRED
+        -1978335135    = @{ Category = 'Success';    Description = 'Package already installed' }                           # 0x8A150061
+        -1978334963    = @{ Category = 'Success';    Description = 'Another version already installed' }                   # 0x8A15010D
+        -1978334962    = @{ Category = 'Success';    Description = 'Higher version already installed (downgrade)' }        # 0x8A15010E
+        -1978334965    = @{ Category = 'Success';    Description = 'Reboot initiated to finish installation' }             # 0x8A15010B
+        -1978335189    = @{ Category = 'Success';    Description = 'No applicable update found' }                          # 0x8A15002B
+
+        # ── RetryScope: retry with --scope user (for user-detected apps) ──
+        -1978335216    = @{ Category = 'RetryScope'; Description = 'No applicable installer for current scope' }           # 0x8A150010
+
+        # ── RetryLater: transient – defer to next Intune cycle ──
+        -1978334975    = @{ Category = 'RetryLater'; Description = 'Application is currently running' }                    # 0x8A150101
+        -1978334974    = @{ Category = 'RetryLater'; Description = 'Another installation in progress' }                    # 0x8A150102
+        -1978334973    = @{ Category = 'RetryLater'; Description = 'One or more file is in use' }                          # 0x8A150103
+        -1978334971    = @{ Category = 'RetryLater'; Description = 'Disk full' }                                           # 0x8A150105
+        -1978334970    = @{ Category = 'RetryLater'; Description = 'Insufficient memory' }                                 # 0x8A150106
+        -1978334969    = @{ Category = 'RetryLater'; Description = 'No network connectivity' }                             # 0x8A150107
+        -1978334967    = @{ Category = 'RetryLater'; Description = 'Reboot required to finish installation' }              # 0x8A150109
+        -1978334966    = @{ Category = 'RetryLater'; Description = 'Reboot required then try again' }                      # 0x8A15010A
+        -1978334959    = @{ Category = 'RetryLater'; Description = 'Application in use by another application' }           # 0x8A150111
+        -1978335123    = @{ Category = 'RetryLater'; Description = 'Service busy or unavailable' }                         # 0x8A15006D
+        -1978335224    = @{ Category = 'RetryLater'; Description = 'Download failed' }                                     # 0x8A150008
+        -1978335186    = @{ Category = 'RetryLater'; Description = 'Download size mismatch' }                              # 0x8A15002E
+        -1978335126    = @{ Category = 'RetryLater'; Description = 'Application shutdown signal received' }                # 0x8A15006A
+        -1978335125    = @{ Category = 'RetryLater'; Description = 'Failed to download dependencies' }                     # 0x8A15006B
+
+        # ── Fail: unrecoverable without human intervention ──
+        -1978335231    = @{ Category = 'Fail'; Description = 'Internal error' }                                            # 0x8A150001
+        -1978335230    = @{ Category = 'Fail'; Description = 'Invalid command line arguments' }                            # 0x8A150002
+        -1978335229    = @{ Category = 'Fail'; Description = 'Command failed' }                                            # 0x8A150003
+        -1978335228    = @{ Category = 'Fail'; Description = 'Opening manifest failed' }                                   # 0x8A150004
+        -1978335226    = @{ Category = 'Fail'; Description = 'ShellExecute install failed' }                               # 0x8A150006
+        -1978335225    = @{ Category = 'Fail'; Description = 'Manifest version higher than supported; update winget' }     # 0x8A150007
+        -1978335221    = @{ Category = 'Fail'; Description = 'Configured source information is corrupt' }                  # 0x8A15000B
+        -1978335217    = @{ Category = 'Fail'; Description = 'Source data missing' }                                       # 0x8A15000F
+        -1978335215    = @{ Category = 'Fail'; Description = 'Installer hash does not match manifest' }                    # 0x8A150011
+        -1978335212    = @{ Category = 'Fail'; Description = 'No packages found' }                                         # 0x8A150014
+        -1978335210    = @{ Category = 'Fail'; Description = 'Multiple packages found matching criteria' }                 # 0x8A150016
+        -1978335209    = @{ Category = 'Fail'; Description = 'No manifest found matching criteria' }                       # 0x8A150017
+        -1978335207    = @{ Category = 'Fail'; Description = 'Command requires administrator privileges' }                 # 0x8A150019
+        -1978335205    = @{ Category = 'Fail'; Description = 'Microsoft Store client blocked by policy' }                  # 0x8A15001B
+        -1978335204    = @{ Category = 'Fail'; Description = 'Microsoft Store app blocked by policy' }                     # 0x8A15001C
+        -1978335187    = @{ Category = 'Fail'; Description = 'Installer failed security check' }                           # 0x8A15002D
+        -1978335174    = @{ Category = 'Fail'; Description = 'Blocked by Group Policy' }                                   # 0x8A15003A
+        -1978335169    = @{ Category = 'Fail'; Description = 'Source data corrupted or tampered' }                         # 0x8A15003F
+        -1978335163    = @{ Category = 'Fail'; Description = 'Failed to open source' }                                     # 0x8A150045
+        -1978335157    = @{ Category = 'Fail'; Description = 'Failed to open one or more sources' }                        # 0x8A15004B
+        -1978335159    = @{ Category = 'Fail'; Description = 'MSI install failed' }                                        # 0x8A150049
+        -1978335153    = @{ Category = 'Fail'; Description = 'Upgrade version not newer than installed' }                   # 0x8A15004F
+        -1978335146    = @{ Category = 'Fail'; Description = 'Installer prohibits elevation' }                              # 0x8A150056
+        -1978335138    = @{ Category = 'Fail'; Description = 'Pinned certificate mismatch' }                               # 0x8A15005E
+        -1978335128    = @{ Category = 'Fail'; Description = 'Package has a pin that prevents upgrade' }                    # 0x8A150068
+        -1978335122    = @{ Category = 'Fail'; Description = 'Package is a stub; full package needed' }                     # 0x8A150069
+        -1978334972    = @{ Category = 'Fail'; Description = 'Missing dependency on system' }                               # 0x8A150104
+        -1978334968    = @{ Category = 'Fail'; Description = 'Installation error; contact support' }                        # 0x8A150108
+        -1978334961    = @{ Category = 'Fail'; Description = 'Blocked by organization policy' }                             # 0x8A15010F
+        -1978334960    = @{ Category = 'Fail'; Description = 'Failed to install package dependencies' }                     # 0x8A150110
+        -1978334958    = @{ Category = 'Fail'; Description = 'Invalid parameter' }                                          # 0x8A150112
+        -1978334957    = @{ Category = 'Fail'; Description = 'Package not supported by system' }                            # 0x8A150113
+        -1978334956    = @{ Category = 'Fail'; Description = 'Installer does not support upgrading existing package' }      # 0x8A150114
+    }
+    if ($codeMap.ContainsKey($ExitCode)) { return $codeMap[$ExitCode] }
+    return @{ Category = 'Unknown'; Description = "Unmapped exit code $ExitCode (hex: 0x$( '{0:X8}' -f [uint32]$ExitCode ))" }
+}
 
 if ($enableLogFile -and -not (Test-Path -Path $logFileDirectory)) {
     New-Item -ItemType Directory -Path $logFileDirectory -Force | Out-Null
@@ -51,7 +145,6 @@ function Write-Log {
 
     if (-not $log) { return }
 
-    # Per-tag switches
     if (($Tag -eq "Debug") -and (-not $logDebug)) { return }
     if (($Tag -eq "Get")   -and (-not $logGet))   { return }
     if (($Tag -eq "Run")   -and (-not $logRun))   { return }
@@ -85,9 +178,7 @@ function Write-Log {
         try {
             Add-Content -Path $logFile -Value $logMessage -Encoding UTF8
         }
-        catch {
-            # Logging must never block script execution
-        }
+        catch { }
     }
 
     Write-Host "$timestamp " -NoNewline
@@ -116,10 +207,6 @@ Write-Log "======== Script Started ========" -Tag "Start"
 Write-Log "ComputerName: $env:COMPUTERNAME | User: $env:USERNAME | Script: $scriptName" -Tag "Info"
 
 # ---------------------------[ Winget Path Resolver ]---------------------------
-# Resolves winget.exe path handling:
-# - Multiple install folders (e.g. after updates: 1.21.x and 1.22.x both present)
-# - Architecture: prefers x64, then arm64 (avoids ambiguity on ARM64 devices)
-# - ProgramW6432: correct 64-bit WindowsApps path even when script runs in 32-bit context
 function Get-WingetPath {
     [CmdletBinding()]
     param()
@@ -137,7 +224,6 @@ function Get-WingetPath {
 
             if (-not $wingetFolders) { continue }
 
-            # Multiple folders possible (e.g. old + new version). Pick newest by file version, then CreationTime.
             $candidates = foreach ($folder in $wingetFolders) {
                 $exePath = Join-Path $folder.FullName 'winget.exe'
                 if (-not (Test-Path -LiteralPath $exePath)) { continue }
@@ -164,7 +250,6 @@ function Get-WingetPath {
             }
         }
 
-        # Fallback: user context (e.g. winget installed per-user)
         $userPath = "$env:LocalAppData\Microsoft\WindowsApps\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\winget.exe"
         if (Test-Path -LiteralPath $userPath) {
             return $userPath
@@ -181,41 +266,42 @@ function Get-WingetPath {
     }
 }
 
+# ---------------------------[ Test Pending Reboot ]---------------------------
+function Test-PendingReboot {
+    try {
+        $paths = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+        )
+        foreach ($p in $paths) { if (Test-Path $p) { return $true } }
+        $pn = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
+        if ($pn -and $pn.PendingFileRenameOperations) { return $true }
+        return $false
+    }
+    catch { return $false }
+}
+
 # ---------------------------[ Test Winget Function ]---------------------------
 function Test-Winget {
     [CmdletBinding()]
     param()
-    
+
     Write-Log "Checking Winget availability" -Tag "Get"
-    
+
     try {
         $wingetPath = Get-WingetPath
-        # Get version - capture all output first
         $rawOutput = & $wingetPath -v 2>&1
         $exitCode = $LASTEXITCODE
 
-        # Check exit code first - if 0, winget executed successfully
         if ($exitCode -eq 0) {
-            # Extract version from output (handle various formats: "1.2.3", "v1.2.3", "winget version 1.2.3", etc.)
             $versionLine = $rawOutput | Where-Object { $_ -and ($_ -match '\d+\.\d+') } | Select-Object -First 1
-            if ($versionLine) {
-                # Extract version number (first match of pattern)
-                if ($versionLine -match '(\d+\.\d+(?:\.\d+)?(?:\.\d+)?)') {
-                    $version = $matches[1]
-                    Write-Log "Winget version: $version" -Tag "Success"
-                    return $true
-                }
-                else {
-                    # If we can't parse version but exit code was 0, still consider it success
-                    Write-Log "Winget is available (version output: $($versionLine.Trim()))" -Tag "Success"
-                    return $true
-                }
+            if ($versionLine -and $versionLine -match '(\d+\.\d+(?:\.\d+)?(?:\.\d+)?)') {
+                Write-Log "Winget version: $($matches[1])" -Tag "Success"
             }
             else {
-                # Exit code 0 but no version found - still consider success (winget works)
                 Write-Log "Winget is available (execution successful)" -Tag "Success"
-                return $true
             }
+            return $true
         }
         else {
             Write-Log "Winget execution failed with exit code: $exitCode" -Tag "Error"
@@ -238,176 +324,139 @@ function Test-AppMatch {
     param(
         [Parameter(Mandatory = $true)]
         [string]$AppId,
-        
+
         [Parameter(Mandatory = $true)]
         [string[]]$PatternList
     )
-    
+
     foreach ($pattern in $PatternList) {
-        if ($pattern -match '^\*') {
-            # Wildcard at start: *Firefox
-            $suffix = $pattern.TrimStart('*')
-            if ($AppId -like "*$suffix") {
-                return $true
-            }
-        }
-        elseif ($pattern -match '\*$') {
-            # Wildcard at end: Firefox*
-            $prefix = $pattern.TrimEnd('*')
-            if ($AppId -like "$prefix*") {
-                return $true
-            }
-        }
-        elseif ($pattern -match '\*') {
-            # Wildcard in middle: Fire*fox
-            $regexPattern = $pattern -replace '\*', '.*'
-            if ($AppId -match "^$regexPattern$") {
-                return $true
-            }
-        }
-        else {
-            # Exact match
-            if ($AppId -eq $pattern) {
-                return $true
-            }
+        if ($AppId -like $pattern) {
+            return $true
         }
     }
-    
+
     return $false
 }
 
+# ---------------------------[ Parse Winget Upgrade Output ]---------------------------
+function Parse-WingetUpgradeOutput {
+    [CmdletBinding()]
+    param(
+        [string]$RawOutput,
+        [string]$Scope
+    )
+
+    $updates = @()
+    $unknownCount = 0
+
+    if (-not ($RawOutput -match "-----")) {
+        return $updates
+    }
+
+    $lines = $RawOutput.Split([Environment]::NewLine) | Where-Object { $_ }
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $lines[$i] = $lines[$i] -replace "[\u2026]", " "
+    }
+
+    $fl = 0
+    while ($fl -lt $lines.Count -and -not $lines[$fl].StartsWith("-----")) { $fl++ }
+    if ($fl -ge $lines.Count) { return $updates }
+    $fl = $fl - 1
+    if ($fl -lt 0) { return $updates }
+
+    $index = $lines[$fl] -split '(?<=\s)(?!\s)'
+    if ($index.Count -lt 3) { return $updates }
+
+    $idStart = $($index[0] -replace '[\u4e00-\u9fa5]', '**').Length
+    $versionStart = $idStart + $($index[1] -replace '[\u4e00-\u9fa5]', '**').Length
+    $availableStart = $versionStart + $($index[2] -replace '[\u4e00-\u9fa5]', '**').Length
+
+    for ($i = $fl + 2; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+        if ($line.StartsWith("-----")) {
+            $fl = $i - 1
+            $index = $lines[$fl] -split '(?<=\s)(?!\s)'
+            $idStart = $($index[0] -replace '[\u4e00-\u9fa5]', '**').Length
+            $versionStart = $idStart + $($index[1] -replace '[\u4e00-\u9fa5]', '**').Length
+            $availableStart = $versionStart + $($index[2] -replace '[\u4e00-\u9fa5]', '**').Length
+            continue
+        }
+        if ($line -match "\w\.\w") {
+            $nameDeclination = $($line.Substring(0, $idStart) -replace '[\u4e00-\u9fa5]', '**').Length - $line.Substring(0, $idStart).Length
+            $appName = $line.Substring(0, $idStart - $nameDeclination).TrimEnd()
+            $appId = $line.Substring($idStart - $nameDeclination, $versionStart - $idStart).TrimEnd()
+            $currentVersion = $line.Substring($versionStart - $nameDeclination, $availableStart - $versionStart).TrimEnd()
+            $availableVersion = $line.Substring($availableStart - $nameDeclination).TrimEnd()
+            if ($currentVersion -eq "Unknown" -or $availableVersion -eq "Unknown") {
+                $unknownCount++
+                continue
+            }
+            if ($currentVersion -ne $availableVersion) {
+                $updates += @{
+                    AppId            = $appId
+                    AppName          = $appName
+                    CurrentVersion   = $currentVersion
+                    AvailableVersion = $availableVersion
+                    Scope            = $Scope
+                }
+            }
+        }
+    }
+    return $updates
+}
+
 # ---------------------------[ Get Available Updates ]---------------------------
+# Two calls: without --scope (machine apps by default) + with --scope user (additional user apps)
 function Get-AvailableUpdates {
     [CmdletBinding()]
     param()
-    
-    Write-Log "Checking for available updates" -Tag "Get"
+
+    Write-Log "Checking for available updates (default + user scope)" -Tag "Get"
     $wingetPath = Get-WingetPath
-    
+
     try {
-        # Set UTF-8 encoding to properly handle Unicode characters (like ellipsis \u2026)
-        # This prevents encoding issues where characters appear as garbled text (e.g., ΓÇª)
         $previousOutputEncoding = [Console]::OutputEncoding
         [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
-        
+
+        $allUpdates = @()
+
+        # Call 1: no --scope flag (returns machine-scoped apps by default)
         try {
-            # WAU uses: winget upgrade --source winget (NO accept flags for listing)
-            # Filter out lines starting with space (progress indicators) - matches WAU exactly
-            # WAU does NOT redirect stderr (no 2>&1)
-            $upgradeResult = & $wingetPath upgrade --source winget | 
-                Where-Object { $_ -notlike " *" } | 
+            $upgradeResult = & $wingetPath upgrade --source winget |
+                Where-Object { $_ -notlike " *" } |
                 Out-String
+            $parsed = Parse-WingetUpgradeOutput -RawOutput $upgradeResult -Scope $null
+            foreach ($u in $parsed) { $allUpdates += $u }
+            Write-Log "Default scope: found $($parsed.Count) app(s) with updates" -Tag "Debug"
         }
-        finally {
-            # Restore previous encoding
-            [Console]::OutputEncoding = $previousOutputEncoding
+        catch {
+            Write-Log "Error getting updates (default scope): $_" -Tag "Debug"
         }
-        
-        # WAU checks for separator line - doesn't check exit code!
-        # Check if output contains valid data (header separator line with dashes)
-        if (-not ($upgradeResult -match "-----")) {
-            Write-Log "No update found. Winget upgrade output does not contain table separator." -Tag "Info"
-            return @()
+
+        # Call 2: --scope user (returns additional user-scoped apps)
+        try {
+            $upgradeResult = & $wingetPath upgrade --source winget --scope user |
+                Where-Object { $_ -notlike " *" } |
+                Out-String
+            $parsed = Parse-WingetUpgradeOutput -RawOutput $upgradeResult -Scope 'user'
+            foreach ($u in $parsed) { $allUpdates += $u }
+            Write-Log "User scope: found $($parsed.Count) app(s) with updates" -Tag "Debug"
         }
-        
-        # Split output into lines, removing empty lines
-        $lines = $upgradeResult.Split([Environment]::NewLine) | Where-Object { $_ }
-        
-        # Replace ellipsis characters (\u2026) - WAU does this to handle long names
-        # With proper UTF-8 encoding, this should now work correctly
-        for ($i = 0; $i -lt $lines.Count; $i++) {
-            $lines[$i] = $lines[$i] -replace "[\u2026]", " "
+        catch {
+            Write-Log "Error getting updates (user scope): $_" -Tag "Debug"
         }
-        
-        # Find the separator line (starts with "-----")
-        $fl = 0
-        while ($fl -lt $lines.Count -and -not $lines[$fl].StartsWith("-----")) {
-            $fl++
-        }
-        
-        if ($fl -ge $lines.Count) {
-            Write-Log "Could not find table separator in winget output" -Tag "Error"
-            return @()
-        }
-        
-        # Get header line (one line before separator)
-        $fl = $fl - 1
-        if ($fl -lt 0) {
-            Write-Log "Could not find header line in winget output" -Tag "Error"
-            return @()
-        }
-        
-        # Split header into columns (preserving trailing spaces for positioning)
-        # WAU uses this exact regex to split on space boundaries
-        $index = $lines[$fl] -split '(?<=\s)(?!\s)'
-        
-        # Ensure we have at least 3 columns (Name, Id, Version, Available)
-        if ($index.Count -lt 3) {
-            Write-Log "Invalid header format - expected at least 3 columns" -Tag "Error"
-            return @()
-        }
-        
-        # Calculate column positions (handle non-Latin characters by replacing with **)
-        # WAU calculates these positions exactly like this
-        $idStart = $($index[0] -replace '[\u4e00-\u9fa5]', '**').Length
-        $versionStart = $idStart + $($index[1] -replace '[\u4e00-\u9fa5]', '**').Length
-        $availableStart = $versionStart + $($index[2] -replace '[\u4e00-\u9fa5]', '**').Length
-        
-        # Parse each data line
+
+        # Deduplicate by AppId (prefer non-user scope if same app appears in both)
+        $seen = @{}
         $updates = @()
-        $unknownCount = 0
-        
-        For ($i = $fl + 2; $i -lt $lines.Count; $i++) {
-            # Ellipsis already replaced earlier, just get the line
-            $line = $lines[$i]
-            
-            # Handle multiple tables (new header encountered)
-            if ($line.StartsWith("-----")) {
-                $fl = $i - 1
-                $index = $lines[$fl] -split '(?<=\s)(?!\s)'
-                $idStart = $($index[0] -replace '[\u4e00-\u9fa5]', '**').Length
-                $versionStart = $idStart + $($index[1] -replace '[\u4e00-\u9fa5]', '**').Length
-                $availableStart = $versionStart + $($index[2] -replace '[\u4e00-\u9fa5]', '**').Length
-                continue
-            }
-            
-            # Check if line contains an application entry (has format word.word)
-            if ($line -match "\w\.\w") {
-                # Calculate name declination for non-Latin character handling
-                # WAU uses this exact calculation
-                $nameDeclination = $($line.Substring(0, $idStart) -replace '[\u4e00-\u9fa5]', '**').Length - $line.Substring(0, $idStart).Length
-                
-                # Extract values using WAU's exact substring logic - ONLY TrimEnd(), no additional cleaning
-                # WAU does NOT do any additional Trim(), character removal, or validation
-                $appName = $line.Substring(0, $idStart - $nameDeclination).TrimEnd()
-                $appId = $line.Substring($idStart - $nameDeclination, $versionStart - $idStart).TrimEnd()
-                $currentVersion = $line.Substring($versionStart - $nameDeclination, $availableStart - $versionStart).TrimEnd()
-                $availableVersion = $line.Substring($availableStart - $nameDeclination).TrimEnd()
-                
-                # Skip apps with "Unknown" version (WAU behavior)
-                if ($currentVersion -eq "Unknown" -or $availableVersion -eq "Unknown") {
-                    $unknownCount++
-                    Write-Log "Skipping app with Unknown version: $appId" -Tag "Debug"
-                    continue
-                }
-                
-                # Skip if versions are the same
-                if ($currentVersion -ne $availableVersion) {
-                    $updates += @{
-                        AppId            = $appId
-                        AppName          = $appName
-                        CurrentVersion   = $currentVersion
-                        AvailableVersion = $availableVersion
-                    }
-                }
+        foreach ($u in $allUpdates) {
+            if (-not $seen.ContainsKey($u.AppId)) {
+                $seen[$u.AppId] = $true
+                $updates += $u
             }
         }
-        
-        if ($unknownCount -gt 0) {
-            Write-Log "Skipped $unknownCount app(s) with Unknown version" -Tag "Debug"
-        }
-        
-        Write-Log "Found $($updates.Count) apps with available updates" -Tag "Get"
+
+        Write-Log "Found $($updates.Count) unique apps with available updates" -Tag "Get"
         return $updates
     }
     catch {
@@ -415,98 +464,167 @@ function Get-AvailableUpdates {
         Write-Log $_.ScriptStackTrace -Tag "Debug"
         return @()
     }
+    finally {
+        [Console]::OutputEncoding = $previousOutputEncoding
+    }
 }
 
-# ---------------------------[ Filter Updates by Blacklist ]---------------------------
+# ---------------------------[ Filter Updates by Blacklist or Whitelist ]---------------------------
 function Select-FilteredUpdates {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [array]$Updates,
-        
+
         [Parameter(Mandatory = $true)]
-        [string[]]$Blacklist
+        [ValidateSet('Blacklist', 'Whitelist')]
+        [string]$ListMode,
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$Blacklist = @(),
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$Whitelist = @()
     )
-    
+
     if ($null -eq $Updates -or $Updates.Count -eq 0) {
         return @()
     }
-    
+
     $filteredUpdates = @()
-    
+
     foreach ($update in $Updates) {
-        # Validate update object structure
         if (-not $update -or -not $update.AppId) {
             Write-Log "Invalid update object encountered, skipping" -Tag "Debug"
             continue
         }
-        
+
         $appId = $update.AppId
-        
-        # Exclude apps in blacklist
-        if ($null -ne $Blacklist -and $Blacklist.Count -gt 0) {
-            if (Test-AppMatch -AppId $appId -PatternList $Blacklist) {
-                Write-Log "App excluded (in blacklist): $appId" -Tag "Debug"
+
+        if ($ListMode -eq 'Blacklist') {
+            if ($null -ne $Blacklist -and $Blacklist.Count -gt 0) {
+                if (Test-AppMatch -AppId $appId -PatternList $Blacklist) {
+                    Write-Log "App excluded (blacklist): $appId" -Tag "Debug"
+                    continue
+                }
+            }
+        }
+        elseif ($ListMode -eq 'Whitelist') {
+            if ($null -eq $Whitelist -or $Whitelist.Count -eq 0) {
+                Write-Log "Whitelist mode with empty whitelist; no apps included" -Tag "Info"
+                return @()
+            }
+            if (-not (Test-AppMatch -AppId $appId -PatternList $Whitelist)) {
+                Write-Log "App excluded (not in whitelist): $appId" -Tag "Debug"
                 continue
             }
         }
-        
+
         $filteredUpdates += $update
     }
-    
+
     Write-Log "Filtered to $($filteredUpdates.Count) apps requiring updates" -Tag "Get"
     return $filteredUpdates
 }
 
 # ---------------------------[ Update Application ]---------------------------
+# Upgrade flow:
+#   1. Try winget upgrade without --scope (let winget auto-detect)
+#   2. In-progress wait loop: if another install is running, wait 30s and retry (up to 5x)
+#   3. RetryScope: if "no applicable installer" and app was detected as user-scoped,
+#      retry once with --scope user
+#   4. RetryLater: transient errors (disk full, no network, app running) return $null
+#      so Intune retries next cycle instead of flagging a failure
+#   5. Fail: unrecoverable errors return $false
 function Update-Application {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [string]$AppId,
-        
+
         [Parameter(Mandatory = $true)]
-        [string]$WingetPath
+        [string]$WingetPath,
+
+        [Parameter(Mandatory = $false)]
+        [string]$Scope
     )
-    
-    Write-Log "Updating application: $AppId" -Tag "Debug"
-    
+
+    $scopeLabel = if ($Scope -eq 'user') { 'user' } else { 'default' }
+    Write-Log "Updating: $AppId (detected scope: $scopeLabel)" -Tag "Run"
+
+    $maxInProgressRetries   = 5
+    $inProgressDelaySeconds = 30
+
+    function Invoke-Upgrade {
+        param([bool]$WithScopeUser)
+        $wingetArgs = @('upgrade', '--id', $AppId, '-e', '--accept-package-agreements', '--accept-source-agreements', '-h', '--source', 'winget')
+        if ($WithScopeUser) { $wingetArgs += '--scope', 'user' }
+        Write-Log "Invoking: winget $($wingetArgs -join ' ')" -Tag "Debug"
+        & $WingetPath @wingetArgs 2>&1 | Where-Object { $_ -notlike " *" }
+    }
+
     try {
-        # Execute winget upgrade - WAU uses: winget upgrade --id <AppId> -e --accept-package-agreements --accept-source-agreements -s winget -h
-        # -e = exact match, -h = silent mode, -s winget = source
-        # Filter out lines starting with space (progress indicators) - matches WAU behavior
-        $upgradeOutput = & $WingetPath upgrade --id $AppId `
-            -e `
-            --accept-package-agreements `
-            --accept-source-agreements `
-            -s winget `
-            -h 2>&1 | 
-            Where-Object { $_ -notlike " *" }
-        
-        $exitCode = $LASTEXITCODE
-        
-        # Ensure we have an array even if filtering returns null
-        if ($null -eq $upgradeOutput) {
-            $upgradeOutput = @()
+        # ── Attempt 1: upgrade without --scope ──
+        $inProgressCount = 0
+        do {
+            if ($inProgressCount -gt 0) {
+                Write-Log "Another installation in progress. Waiting ${inProgressDelaySeconds}s ($inProgressCount/$maxInProgressRetries)..." -Tag "Info"
+                Start-Sleep -Seconds $inProgressDelaySeconds
+            }
+
+            $upgradeOutput = Invoke-Upgrade -WithScopeUser $false
+            $exitCode = $LASTEXITCODE
+            if ($null -eq $upgradeOutput) { $upgradeOutput = @() }
+
+            if ($exitCode -ne -1978334974) { break }
+            $inProgressCount++
+        } while ($inProgressCount -le $maxInProgressRetries)
+
+        if ($exitCode -eq -1978334974) {
+            Write-Log "Still blocked after $maxInProgressRetries in-progress retries for $AppId" -Tag "Info"
+            return $null
         }
-        
-        # WAU checks installation confirmation - we'll check exit code and verify app is updated
-        if ($exitCode -eq 0) {
+
+        $exitInfo = Get-WingetExitCodeInfo -ExitCode $exitCode
+
+        # ── Success ──
+        if ($exitInfo.Category -eq 'Success') {
             Write-Log "Successfully updated: $AppId" -Tag "Success"
             return $true
         }
-        else {
-            Write-Log "Failed to update $AppId - Exit code: $exitCode" -Tag "Error"
-            # Only log actual error messages, filter out noise
-            $errorMessages = $upgradeOutput | Where-Object { 
-                $_ -match 'error|failed|exception|unable|cannot|could not' -or 
-                ($_ -match '^[A-Z]' -and $_ -notmatch '^Loading|^Found|^Verifying')
+
+        # ── RetryScope: if "no applicable installer" and the app was detected as user-scoped ──
+        if ($exitInfo.Category -eq 'RetryScope' -and $Scope -eq 'user') {
+            Write-Log "No applicable installer without scope; retrying $AppId with --scope user." -Tag "Info"
+
+            $upgradeOutput = Invoke-Upgrade -WithScopeUser $true
+            $exitCode = $LASTEXITCODE
+            $exitInfo = Get-WingetExitCodeInfo -ExitCode $exitCode
+
+            if ($exitInfo.Category -eq 'Success') {
+                Write-Log "Successfully updated: $AppId (with --scope user)" -Tag "Success"
+                return $true
             }
-            if ($errorMessages) {
-                Write-Log "Error: $($errorMessages -join '; ')" -Tag "Debug"
-            }
-            return $false
+
+            Write-Log "Retry with --scope user failed for $AppId - $exitCode ($($exitInfo.Description))" -Tag "Debug"
         }
+
+        # ── RetryLater: transient ──
+        if ($exitInfo.Category -eq 'RetryLater') {
+            Write-Log "Transient error for $AppId ($($exitInfo.Description)); will retry next Intune cycle." -Tag "Info"
+            return $null
+        }
+
+        # ── Fail / Unknown ──
+        $errorMessages = $upgradeOutput | Where-Object {
+            $_ -match 'error|failed|exception|unable|cannot|could not' -or
+            ($_ -match '^[A-Z]' -and $_ -notmatch '^Loading|^Found|^Verifying|^Successfully')
+        }
+        if ($errorMessages) {
+            Write-Log "Winget output for $AppId : $($errorMessages -join '; ')" -Tag "Debug"
+        }
+        Write-Log "Failed to update $AppId - $($exitInfo.Description) ($($exitInfo.Category))" -Tag "Error"
+        return $false
     }
     catch {
         Write-Log "Error updating $AppId : $_" -Tag "Error"
@@ -517,82 +635,96 @@ function Update-Application {
 
 # ---------------------------[ Main Remediation Logic ]---------------------------
 try {
-    # Test Winget availability
     if (-not (Test-Winget)) {
-        Write-Log "Winget is not available or not working properly" -Tag "Error"
+        Write-Log "Winget is not available or not working properly." -Tag "Error"
         Complete-Script -ExitCode 1
-        return
     }
-    
+
+    # One-time source refresh before we start
+    $wingetPath = Get-WingetPath
+    Write-Log "Refreshing winget sources..." -Tag "Run"
+    & $wingetPath source update 2>&1 | Out-Null
+    Write-Log "Source refresh complete." -Tag "Debug"
+
+    if (Test-PendingReboot) {
+        Write-Log "Pending reboot detected on system." -Tag "Info"
+    }
+
     # Get available updates
     $availableUpdates = Get-AvailableUpdates
-    
+
     if ($availableUpdates.Count -eq 0) {
         Write-Log "No updates available - all apps are up to date" -Tag "Success"
         Complete-Script -ExitCode 0
     }
-    
-    # Filter updates based on blacklist
-    if ($null -ne $blacklistApps -and $blacklistApps.Count -gt 0) {
-        Write-Log "Using blacklist with $($blacklistApps.Count) entries" -Tag "Info"
+
+    if ($listMode -eq 'Blacklist') {
+        $listCount = if ($null -ne $blacklistApps) { $blacklistApps.Count } else { 0 }
+        Write-Log "Using blacklist mode with $listCount entries" -Tag "Info"
     }
     else {
-        Write-Log "No blacklist configured - all apps will be updated" -Tag "Info"
+        $listCount = if ($null -ne $whitelistApps) { $whitelistApps.Count } else { 0 }
+        Write-Log "Using whitelist mode with $listCount entries" -Tag "Info"
     }
-    
-    $filteredUpdates = Select-FilteredUpdates -Updates $availableUpdates -Blacklist $blacklistApps
-    
+
+    $filteredUpdates = Select-FilteredUpdates -Updates $availableUpdates -ListMode $listMode -Blacklist $blacklistApps -Whitelist $whitelistApps
+
     if ($filteredUpdates.Count -eq 0) {
         Write-Log "No updates needed after filtering - all managed apps are up to date" -Tag "Success"
         Complete-Script -ExitCode 0
     }
-    
-    # Get Winget path for updates (reuse to avoid multiple calls)
-    $wingetPath = Get-WingetPath
-    
+
     # Perform updates
     Write-Log "Starting update process for $($filteredUpdates.Count) application(s)" -Tag "Run"
-    
-    $successCount = 0
-    $failureCount = 0
-    $failedApps = @()
-    
+
+    $successCount   = 0
+    $failureCount   = 0
+    $deferredCount  = 0
+    $failedApps     = @()
+    $deferredApps   = @()
+
     $updateIndex = 0
     foreach ($update in $filteredUpdates) {
         $updateIndex++
-        
-        # Validate update object before processing
+
         if (-not $update -or -not $update.AppId) {
             Write-Log "[$updateIndex/$($filteredUpdates.Count)] Skipping invalid update object" -Tag "Error"
             $failureCount++
             continue
         }
-        
+
         Write-Log "[$updateIndex/$($filteredUpdates.Count)] Processing: $($update.AppId) ($($update.CurrentVersion) -> $($update.AvailableVersion))" -Tag "Info"
-        
-        if (Update-Application -AppId $update.AppId -WingetPath $wingetPath) {
+
+        $result = Update-Application -AppId $update.AppId -WingetPath $wingetPath -Scope $update.Scope
+
+        if ($result -eq $true) {
             $successCount++
+        }
+        elseif ($null -eq $result) {
+            $deferredCount++
+            $deferredApps += $update.AppId
         }
         else {
             $failureCount++
             $failedApps += $update.AppId
         }
-        
-        # Small delay between updates to avoid overwhelming the system
-        Start-Sleep -Seconds 2
+
+        Start-Sleep -Seconds 3
     }
-    
+
     # Summary
-    Write-Log "Update process completed" -Tag "Debug"
     Write-Log "Successfully updated: $successCount application(s)" -Tag "Success"
-    
+
+    if ($deferredCount -gt 0) {
+        Write-Log "Deferred (transient): $deferredCount application(s) - $($deferredApps -join ', ')" -Tag "Info"
+    }
+
     if ($failureCount -gt 0) {
-        Write-Log "Failed to update: $failureCount application(s)" -Tag "Error"
-        Write-Log "Failed apps: $($failedApps -join ', ')" -Tag "Error"
+        Write-Log "Failed to update: $failureCount application(s) - $($failedApps -join ', ')" -Tag "Error"
         Complete-Script -ExitCode 1
     }
     else {
-        Write-Log "All updates completed successfully" -Tag "Success"
+        Write-Log "All updates completed or deferred successfully" -Tag "Success"
         Complete-Script -ExitCode 0
     }
 }

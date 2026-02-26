@@ -1,7 +1,10 @@
 # ---------------------------[ Config ]---------------------------
+# ListMode: 'Blacklist' = update all except listed; 'Whitelist' = update only listed (must match remediation.ps1)
+$listMode = 'Blacklist'
+
 $blacklistApps = @(
     'Microsoft.Edge*',
-    'Microsoft.Teams*',    
+    'Microsoft.Teams*',
     'Microsoft.Office',
     'Microsoft.OneDrive',
     'Microsoft.AppInstaller',
@@ -19,19 +22,26 @@ $blacklistApps = @(
     'Lenovo.SUHelper'
 )
 
+$whitelistApps = @(
+    '7zip.7zip',
+    'Google.Chrome',
+    'Microsoft.DotNet*',
+    'Microsoft.VCRedist*',
+    'Notepad++.Notepad++'
+)
+
 # ---------------------------[ Script Start Timestamp ]---------------------------
 $scriptStartTime = Get-Date
 
 # ---------------------------[ Script Name ]---------------------------
-$scriptName  = "Winget-AppUpdate"
+$scriptName  = 'Winget-AppUpdate'
 $logFileName = "detection.log"
 
 # ---------------------------[ Logging Setup ]---------------------------
-# Logging configuration
 $log           = $true
-$logDebug      = $true    # Set to $true for verbose DEBUG logging
-$logGet        = $true    # enable/disable all [Get] logs
-$logRun        = $true    # enable/disable all [Run] logs
+$logDebug      = $true
+$logGet        = $true
+$logRun        = $true
 $enableLogFile = $true
 
 $logFileDirectory = "$env:ProgramData\IntuneLogs\Scripts\$scriptName"
@@ -51,7 +61,6 @@ function Write-Log {
 
     if (-not $log) { return }
 
-    # Per-tag switches
     if (($Tag -eq "Debug") -and (-not $logDebug)) { return }
     if (($Tag -eq "Get")   -and (-not $logGet))   { return }
     if (($Tag -eq "Run")   -and (-not $logRun))   { return }
@@ -85,9 +94,7 @@ function Write-Log {
         try {
             Add-Content -Path $logFile -Value $logMessage -Encoding UTF8
         }
-        catch {
-            # Logging must never block script execution
-        }
+        catch { }
     }
 
     Write-Host "$timestamp " -NoNewline
@@ -116,10 +123,6 @@ Write-Log "======== Script Started ========" -Tag "Start"
 Write-Log "ComputerName: $env:COMPUTERNAME | User: $env:USERNAME | Script: $scriptName" -Tag "Info"
 
 # ---------------------------[ Winget Path Resolver ]---------------------------
-# Resolves winget.exe path handling:
-# - Multiple install folders (e.g. after updates: 1.21.x and 1.22.x both present)
-# - Architecture: prefers x64, then arm64 (avoids ambiguity on ARM64 devices)
-# - ProgramW6432: correct 64-bit WindowsApps path even when script runs in 32-bit context
 function Get-WingetPath {
     [CmdletBinding()]
     param()
@@ -137,7 +140,6 @@ function Get-WingetPath {
 
             if (-not $wingetFolders) { continue }
 
-            # Multiple folders possible (e.g. old + new version). Pick newest by file version, then CreationTime.
             $candidates = foreach ($folder in $wingetFolders) {
                 $exePath = Join-Path $folder.FullName 'winget.exe'
                 if (-not (Test-Path -LiteralPath $exePath)) { continue }
@@ -164,7 +166,6 @@ function Get-WingetPath {
             }
         }
 
-        # Fallback: user context (e.g. winget installed per-user)
         $userPath = "$env:LocalAppData\Microsoft\WindowsApps\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\winget.exe"
         if (Test-Path -LiteralPath $userPath) {
             return $userPath
@@ -185,37 +186,23 @@ function Get-WingetPath {
 function Test-Winget {
     [CmdletBinding()]
     param()
-    
+
     Write-Log "Checking Winget availability" -Tag "Get"
-    
+
     try {
         $wingetPath = Get-WingetPath
-        # Get version - capture all output first
         $rawOutput = & $wingetPath -v 2>&1
         $exitCode = $LASTEXITCODE
 
-        # Check exit code first - if 0, winget executed successfully
         if ($exitCode -eq 0) {
-            # Extract version from output (handle various formats: "1.2.3", "v1.2.3", "winget version 1.2.3", etc.)
             $versionLine = $rawOutput | Where-Object { $_ -and ($_ -match '\d+\.\d+') } | Select-Object -First 1
-            if ($versionLine) {
-                # Extract version number (first match of pattern)
-                if ($versionLine -match '(\d+\.\d+(?:\.\d+)?(?:\.\d+)?)') {
-                    $version = $matches[1]
-                    Write-Log "Winget version: $version" -Tag "Success"
-                    return $true
-                }
-                else {
-                    # If we can't parse version but exit code was 0, still consider it success
-                    Write-Log "Winget is available (version output: $($versionLine.Trim()))" -Tag "Success"
-                    return $true
-                }
+            if ($versionLine -and $versionLine -match '(\d+\.\d+(?:\.\d+)?(?:\.\d+)?)') {
+                Write-Log "Winget version: $($matches[1])" -Tag "Success"
             }
             else {
-                # Exit code 0 but no version found - still consider success (winget works)
                 Write-Log "Winget is available (execution successful)" -Tag "Success"
-                return $true
             }
+            return $true
         }
         else {
             Write-Log "Winget execution failed with exit code: $exitCode" -Tag "Error"
@@ -238,177 +225,139 @@ function Test-AppMatch {
     param(
         [Parameter(Mandatory = $true)]
         [string]$AppId,
-        
+
         [Parameter(Mandatory = $true)]
         [string[]]$PatternList
     )
-    
+
     foreach ($pattern in $PatternList) {
-        if ($pattern -match '^\*') {
-            # Wildcard at start: *Firefox
-            $suffix = $pattern.TrimStart('*')
-            if ($AppId -like "*$suffix") {
-                return $true
-            }
-        }
-        elseif ($pattern -match '\*$') {
-            # Wildcard at end: Firefox*
-            $prefix = $pattern.TrimEnd('*')
-            if ($AppId -like "$prefix*") {
-                return $true
-            }
-        }
-        elseif ($pattern -match '\*') {
-            # Wildcard in middle: Fire*fox
-            $regexPattern = $pattern -replace '\*', '.*'
-            if ($AppId -match "^$regexPattern$") {
-                return $true
-            }
-        }
-        else {
-            # Exact match
-            if ($AppId -eq $pattern) {
-                return $true
-            }
+        if ($AppId -like $pattern) {
+            return $true
         }
     }
-    
+
     return $false
 }
 
+# ---------------------------[ Parse Winget Upgrade Output ]---------------------------
+function Parse-WingetUpgradeOutput {
+    [CmdletBinding()]
+    param(
+        [string]$RawOutput,
+        [string]$Scope
+    )
+
+    $updates = @()
+    $unknownCount = 0
+
+    if (-not ($RawOutput -match "-----")) {
+        return $updates
+    }
+
+    $lines = $RawOutput.Split([Environment]::NewLine) | Where-Object { $_ }
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $lines[$i] = $lines[$i] -replace "[\u2026]", " "
+    }
+
+    $fl = 0
+    while ($fl -lt $lines.Count -and -not $lines[$fl].StartsWith("-----")) { $fl++ }
+    if ($fl -ge $lines.Count) { return $updates }
+    $fl = $fl - 1
+    if ($fl -lt 0) { return $updates }
+
+    $index = $lines[$fl] -split '(?<=\s)(?!\s)'
+    if ($index.Count -lt 3) { return $updates }
+
+    $idStart = $($index[0] -replace '[\u4e00-\u9fa5]', '**').Length
+    $versionStart = $idStart + $($index[1] -replace '[\u4e00-\u9fa5]', '**').Length
+    $availableStart = $versionStart + $($index[2] -replace '[\u4e00-\u9fa5]', '**').Length
+
+    for ($i = $fl + 2; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+        if ($line.StartsWith("-----")) {
+            $fl = $i - 1
+            $index = $lines[$fl] -split '(?<=\s)(?!\s)'
+            $idStart = $($index[0] -replace '[\u4e00-\u9fa5]', '**').Length
+            $versionStart = $idStart + $($index[1] -replace '[\u4e00-\u9fa5]', '**').Length
+            $availableStart = $versionStart + $($index[2] -replace '[\u4e00-\u9fa5]', '**').Length
+            continue
+        }
+        if ($line -match "\w\.\w") {
+            $nameDeclination = $($line.Substring(0, $idStart) -replace '[\u4e00-\u9fa5]', '**').Length - $line.Substring(0, $idStart).Length
+            $appName = $line.Substring(0, $idStart - $nameDeclination).TrimEnd()
+            $appId = $line.Substring($idStart - $nameDeclination, $versionStart - $idStart).TrimEnd()
+            $currentVersion = $line.Substring($versionStart - $nameDeclination, $availableStart - $versionStart).TrimEnd()
+            $availableVersion = $line.Substring($availableStart - $nameDeclination).TrimEnd()
+            if ($currentVersion -eq "Unknown" -or $availableVersion -eq "Unknown") {
+                $unknownCount++
+                continue
+            }
+            if ($currentVersion -ne $availableVersion) {
+                $updates += @{
+                    AppId            = $appId
+                    AppName          = $appName
+                    CurrentVersion   = $currentVersion
+                    AvailableVersion = $availableVersion
+                    Scope            = $Scope
+                }
+            }
+        }
+    }
+    return $updates
+}
+
 # ---------------------------[ Get Available Updates ]---------------------------
+# Two calls: without --scope (machine apps by default) + with --scope user (additional user apps)
 function Get-AvailableUpdates {
     [CmdletBinding()]
     param()
-    
-    Write-Log "Checking for available updates" -Tag "Get"
+
+    Write-Log "Checking for available updates (default + user scope)" -Tag "Get"
     $wingetPath = Get-WingetPath
-    
+
     try {
-        # Set UTF-8 encoding to properly handle Unicode characters (like ellipsis \u2026)
-        # This prevents encoding issues where characters appear as garbled text (e.g., ΓÇª)
         $previousOutputEncoding = [Console]::OutputEncoding
         [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
-        
+
+        $allUpdates = @()
+
+        # Call 1: no --scope flag (returns machine-scoped apps by default)
         try {
-            # WAU uses: winget upgrade --source winget (NO accept flags for listing)
-            # Filter out lines starting with space (progress indicators) - matches WAU exactly
-            # WAU does NOT redirect stderr (no 2>&1)
-            $upgradeResult = & $wingetPath upgrade --source winget | 
-                Where-Object { $_ -notlike " *" } | 
+            $upgradeResult = & $wingetPath upgrade --source winget |
+                Where-Object { $_ -notlike " *" } |
                 Out-String
+            $parsed = Parse-WingetUpgradeOutput -RawOutput $upgradeResult -Scope $null
+            foreach ($u in $parsed) { $allUpdates += $u }
+            Write-Log "Default scope: found $($parsed.Count) app(s) with updates" -Tag "Debug"
         }
-        finally {
-            # Restore previous encoding
-            [Console]::OutputEncoding = $previousOutputEncoding
+        catch {
+            Write-Log "Error getting updates (default scope): $_" -Tag "Debug"
         }
-        
-        # WAU checks for separator line - doesn't check exit code!
-        # Check if output contains valid data (header separator line with dashes)
-        if (-not ($upgradeResult -match "-----")) {
-            Write-Log "No update found. Winget upgrade output does not contain table separator." -Tag "Info"
-            Write-Log "Raw winget output: $upgradeResult" -Tag "Debug"
-            return @()
+
+        # Call 2: --scope user (returns additional user-scoped apps)
+        try {
+            $upgradeResult = & $wingetPath upgrade --source winget --scope user |
+                Where-Object { $_ -notlike " *" } |
+                Out-String
+            $parsed = Parse-WingetUpgradeOutput -RawOutput $upgradeResult -Scope 'user'
+            foreach ($u in $parsed) { $allUpdates += $u }
+            Write-Log "User scope: found $($parsed.Count) app(s) with updates" -Tag "Debug"
         }
-        
-        # Split output into lines, removing empty lines
-        $lines = $upgradeResult.Split([Environment]::NewLine) | Where-Object { $_ }
-        
-        # Replace ellipsis characters (\u2026) - WAU does this to handle long names
-        # With proper UTF-8 encoding, this should now work correctly
-        for ($i = 0; $i -lt $lines.Count; $i++) {
-            $lines[$i] = $lines[$i] -replace "[\u2026]", " "
+        catch {
+            Write-Log "Error getting updates (user scope): $_" -Tag "Debug"
         }
-        
-        # Find the separator line (starts with "-----")
-        $fl = 0
-        while ($fl -lt $lines.Count -and -not $lines[$fl].StartsWith("-----")) {
-            $fl++
-        }
-        
-        if ($fl -ge $lines.Count) {
-            Write-Log "Could not find table separator in winget output" -Tag "Error"
-            return @()
-        }
-        
-        # Get header line (one line before separator)
-        $fl = $fl - 1
-        if ($fl -lt 0) {
-            Write-Log "Could not find header line in winget output" -Tag "Error"
-            return @()
-        }
-        
-        # Split header into columns (preserving trailing spaces for positioning)
-        # WAU uses this exact regex to split on space boundaries
-        $index = $lines[$fl] -split '(?<=\s)(?!\s)'
-        
-        # Ensure we have at least 3 columns (Name, Id, Version, Available)
-        if ($index.Count -lt 3) {
-            Write-Log "Invalid header format - expected at least 3 columns" -Tag "Error"
-            return @()
-        }
-        
-        # Calculate column positions (handle non-Latin characters by replacing with **)
-        # WAU calculates these positions exactly like this
-        $idStart = $($index[0] -replace '[\u4e00-\u9fa5]', '**').Length
-        $versionStart = $idStart + $($index[1] -replace '[\u4e00-\u9fa5]', '**').Length
-        $availableStart = $versionStart + $($index[2] -replace '[\u4e00-\u9fa5]', '**').Length
-        
-        # Parse each data line
+
+        # Deduplicate by AppId (prefer non-user scope if same app appears in both)
+        $seen = @{}
         $updates = @()
-        $unknownCount = 0
-        
-        For ($i = $fl + 2; $i -lt $lines.Count; $i++) {
-            # Ellipsis already replaced earlier, just get the line
-            $line = $lines[$i]
-            
-            # Handle multiple tables (new header encountered)
-            if ($line.StartsWith("-----")) {
-                $fl = $i - 1
-                $index = $lines[$fl] -split '(?<=\s)(?!\s)'
-                $idStart = $($index[0] -replace '[\u4e00-\u9fa5]', '**').Length
-                $versionStart = $idStart + $($index[1] -replace '[\u4e00-\u9fa5]', '**').Length
-                $availableStart = $versionStart + $($index[2] -replace '[\u4e00-\u9fa5]', '**').Length
-                continue
-            }
-            
-            # Check if line contains an application entry (has format word.word)
-            if ($line -match "\w\.\w") {
-                # Calculate name declination for non-Latin character handling
-                # WAU uses this exact calculation
-                $nameDeclination = $($line.Substring(0, $idStart) -replace '[\u4e00-\u9fa5]', '**').Length - $line.Substring(0, $idStart).Length
-                
-                # Extract values using WAU's exact substring logic - ONLY TrimEnd(), no additional cleaning
-                # WAU does NOT do any additional Trim(), character removal, or validation
-                $appName = $line.Substring(0, $idStart - $nameDeclination).TrimEnd()
-                $appId = $line.Substring($idStart - $nameDeclination, $versionStart - $idStart).TrimEnd()
-                $currentVersion = $line.Substring($versionStart - $nameDeclination, $availableStart - $versionStart).TrimEnd()
-                $availableVersion = $line.Substring($availableStart - $nameDeclination).TrimEnd()
-                
-                # Skip apps with "Unknown" version (WAU behavior)
-                if ($currentVersion -eq "Unknown" -or $availableVersion -eq "Unknown") {
-                    $unknownCount++
-                    Write-Log "Skipping app with Unknown version: $appId" -Tag "Debug"
-                    continue
-                }
-                
-                # Skip if versions are the same
-                if ($currentVersion -ne $availableVersion) {
-                    $updates += @{
-                        AppId            = $appId
-                        AppName          = $appName
-                        CurrentVersion   = $currentVersion
-                        AvailableVersion = $availableVersion
-                    }
-                }
+        foreach ($u in $allUpdates) {
+            if (-not $seen.ContainsKey($u.AppId)) {
+                $seen[$u.AppId] = $true
+                $updates += $u
             }
         }
-        
-        if ($unknownCount -gt 0) {
-            Write-Log "Skipped $unknownCount app(s) with Unknown version" -Tag "Debug"
-        }
-        
-        Write-Log "Found $($updates.Count) apps with available updates" -Tag "Get"
+
+        Write-Log "Found $($updates.Count) unique apps with available updates" -Tag "Get"
         return $updates
     }
     catch {
@@ -416,87 +365,105 @@ function Get-AvailableUpdates {
         Write-Log $_.ScriptStackTrace -Tag "Debug"
         return @()
     }
+    finally {
+        [Console]::OutputEncoding = $previousOutputEncoding
+    }
 }
 
-# ---------------------------[ Filter Updates by Blacklist ]---------------------------
+# ---------------------------[ Filter Updates by Blacklist or Whitelist ]---------------------------
 function Select-FilteredUpdates {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [array]$Updates,
-        
+
         [Parameter(Mandatory = $true)]
-        [string[]]$Blacklist
+        [ValidateSet('Blacklist', 'Whitelist')]
+        [string]$ListMode,
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$Blacklist = @(),
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$Whitelist = @()
     )
-    
+
     if ($null -eq $Updates -or $Updates.Count -eq 0) {
         return @()
     }
-    
+
     $filteredUpdates = @()
-    
+
     foreach ($update in $Updates) {
-        # Validate update object structure
         if (-not $update -or -not $update.AppId) {
             Write-Log "Invalid update object encountered, skipping" -Tag "Debug"
             continue
         }
-        
+
         $appId = $update.AppId
-        
-        # Exclude apps in blacklist
-        if ($null -ne $Blacklist -and $Blacklist.Count -gt 0) {
-            if (Test-AppMatch -AppId $appId -PatternList $Blacklist) {
-                Write-Log "App excluded (in blacklist): $appId" -Tag "Debug"
+
+        if ($ListMode -eq 'Blacklist') {
+            if ($null -ne $Blacklist -and $Blacklist.Count -gt 0) {
+                if (Test-AppMatch -AppId $appId -PatternList $Blacklist) {
+                    Write-Log "App excluded (blacklist): $appId" -Tag "Debug"
+                    continue
+                }
+            }
+        }
+        elseif ($ListMode -eq 'Whitelist') {
+            if ($null -eq $Whitelist -or $Whitelist.Count -eq 0) {
+                return @()
+            }
+            if (-not (Test-AppMatch -AppId $appId -PatternList $Whitelist)) {
+                Write-Log "App excluded (not in whitelist): $appId" -Tag "Debug"
                 continue
             }
         }
-        
+
         $filteredUpdates += $update
     }
-    
+
     Write-Log "Filtered to $($filteredUpdates.Count) apps requiring updates" -Tag "Get"
     return $filteredUpdates
 }
 
 # ---------------------------[ Main Detection Logic ]---------------------------
 try {
-    # Test Winget availability
     if (-not (Test-Winget)) {
-        Write-Log "Winget is not available or not working properly" -Tag "Error"
+        Write-Log "Winget is not available; detection cannot proceed." -Tag "Error"
         Complete-Script -ExitCode 1
-        return
     }
-    
+
     # Get available updates
     $availableUpdates = Get-AvailableUpdates
-    
+
     if ($availableUpdates.Count -eq 0) {
         Write-Log "No updates available - all apps are up to date" -Tag "Success"
         Complete-Script -ExitCode 0
     }
-    
-    # Filter updates based on blacklist
-    if ($null -ne $blacklistApps -and $blacklistApps.Count -gt 0) {
-        Write-Log "Using blacklist with $($blacklistApps.Count) entries" -Tag "Info"
+
+    if ($listMode -eq 'Blacklist') {
+        $listCount = if ($null -ne $blacklistApps) { $blacklistApps.Count } else { 0 }
+        Write-Log "Using blacklist mode with $listCount entries" -Tag "Info"
     }
     else {
-        Write-Log "No blacklist configured - all apps will be checked" -Tag "Info"
+        $listCount = if ($null -ne $whitelistApps) { $whitelistApps.Count } else { 0 }
+        Write-Log "Using whitelist mode with $listCount entries" -Tag "Info"
     }
-    
-    $filteredUpdates = Select-FilteredUpdates -Updates $availableUpdates -Blacklist $blacklistApps
-    
+
+    $filteredUpdates = Select-FilteredUpdates -Updates $availableUpdates -ListMode $listMode -Blacklist $blacklistApps -Whitelist $whitelistApps
+
     if ($filteredUpdates.Count -eq 0) {
         Write-Log "No updates needed after filtering - all managed apps are up to date" -Tag "Success"
         Complete-Script -ExitCode 0
     }
-    
-    # Log apps that need updating
+
     Write-Log "Apps requiring updates:" -Tag "Info"
     foreach ($update in $filteredUpdates) {
-        Write-Log "  - $($update.AppId): $($update.CurrentVersion) -> $($update.AvailableVersion)" -Tag "Info"
+        $scopeTag = if ($update.Scope -eq 'user') { ' [user]' } else { '' }
+        Write-Log "  - $($update.AppId): $($update.CurrentVersion) -> $($update.AvailableVersion)$scopeTag" -Tag "Info"
     }
-    
+
     Write-Log "Detection complete: $($filteredUpdates.Count) app(s) need updating" -Tag "Success"
     Complete-Script -ExitCode 1
 }
