@@ -10,6 +10,7 @@ $blacklistApps = @(
     'Microsoft.OneDrive',
     'Microsoft.AppInstaller',
     'Microsoft.RemoteDesktopClient',
+    'Microsoft.GlobalSecureAccessClient',
     'Microsoft.VCLibs.*',
     'Fortinet.FortiClientVPN',
     'Mozilla.Firefox*',
