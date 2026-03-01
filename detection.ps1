@@ -12,6 +12,7 @@ $blacklistApps = @(
     'Microsoft.GlobalSecureAccessClient',
     'Microsoft.VCLibs.*',
     '3CX.Softphone',
+    'TrackerSoftware.PDF-XChange*',
     'Fortinet.FortiClientVPN',
     'Mozilla.Firefox*',
     'Opera.Opera*',
