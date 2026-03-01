@@ -17,6 +17,7 @@ $blacklistApps = @(
     'TeamViewer.TeamViewer*',
     'Brave.Brave*',
     'Microsoft.WindowsTerminal',
+    'Adobe.Acrobat.Pro',
     'Adobe.Acrobat.Reader.32-bit',
     'Adobe.Acrobat.Reader.64-bit',
     'Microsoft.PowerShell',
