@@ -1,4 +1,4 @@
-# 🚀 Winget-AutoUpdate Intune Remediation Scripts
+# 🚀 Winget - Update Intune Remediation Scripts
 
 This repository contains Microsoft Intune Remediation scripts that automatically detect and update Windows applications installed via Winget, with **Blacklist** (exclude apps) or **Whitelist** (include only) modes.
 
@@ -229,10 +229,6 @@ Remediation script returns exit code 1.
 ### 🌐 Encoding Issues
 
 App names show garbled characters. The scripts set `[Console]::OutputEncoding` to UTF-8 before calling Winget. Ensure you are using the latest version of the scripts.
-
-## 📄 License
-
-This project follows the same MIT license as Winget-AutoUpdate.
 
 ## 🙏 Credits
 
