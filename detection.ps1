@@ -45,7 +45,7 @@ $logFileName = "detection.log"
 
 # ---------------------------[ Logging Setup ]---------------------------
 $log           = $true
-$logDebug      = $true
+$logDebug      = $false
 $logGet        = $true
 $logRun        = $true
 $enableLogFile = $true
