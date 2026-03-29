@@ -18,7 +18,6 @@ $blacklistApps = @(
     'Opera.Opera*',
     'TeamViewer.TeamViewer*',
     'Brave.Brave*',
-    'KeePassXCTeam.KeePassXC',
     'Microsoft.WindowsTerminal',
     'Adobe.Acrobat.Pro',
     'Adobe.CreativeCloud',
@@ -40,7 +39,7 @@ $whitelistApps = @(
 $scriptStartTime = Get-Date
 
 # ---------------------------[ Script Name ]---------------------------
-$scriptName  = 'Winget-AppUpdate'
+$scriptName  = 'WinGet-Update'
 $logFileName = "detection.log"
 
 # ---------------------------[ Logging Setup ]---------------------------
@@ -54,33 +53,33 @@ $logFileDirectory = "$env:ProgramData\IntuneLogs\Scripts\$scriptName"
 $logFile          = "$logFileDirectory\$logFileName"
 
 if ($enableLogFile -and -not (Test-Path -Path $logFileDirectory)) {
-    New-Item -ItemType Directory -Path $logFileDirectory -Force | Out-Null
+    try {
+        $null = New-Item -ItemType Directory -Path $logFileDirectory -Force -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "Failed to create log directory '$logFileDirectory': $($_.Exception.Message)"
+    }
 }
 
-# ---------------------------[ Logging Function ]---------------------------
+# Logging aligned with https://github.com/Barg0/Intune-Win32-Scripts (compact line, I/O warnings).
 function Write-Log {
     [CmdletBinding()]
     param (
-        [string]$Message,
-        [string]$Tag = "Info"
+        [string]$message,
+        [string]$tag = "Info"
     )
 
     if (-not $log) { return }
 
-    if (($Tag -eq "Debug") -and (-not $logDebug)) { return }
-    if (($Tag -eq "Get")   -and (-not $logGet))   { return }
-    if (($Tag -eq "Run")   -and (-not $logRun))   { return }
+    if (($tag -eq "Debug") -and (-not $logDebug)) { return }
+    if (($tag -eq "Get") -and (-not $logGet)) { return }
+    if (($tag -eq "Run") -and (-not $logRun)) { return }
 
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $tagList   = @("Start","Get","Run","Info","Success","Error","Debug","End")
-    $rawTag    = $Tag.Trim()
-
-    if ($tagList -contains $rawTag) {
-        $rawTag = $rawTag.PadRight(7)
-    }
-    else {
-        $rawTag = "Error  "
-    }
+    $tagList   = @("Start", "Get", "Run", "Info", "Success", "Error", "Debug", "End")
+    $rawTag    = $tag.Trim()
+    if ($tagList -contains $rawTag) { $rawTag = $rawTag.PadRight(7) }
+    else { $rawTag = "Error " }
 
     $color = switch ($rawTag.Trim()) {
         "Start"   { "Cyan" }
@@ -94,20 +93,21 @@ function Write-Log {
         default   { "White" }
     }
 
-    $logMessage = "$timestamp [  $rawTag ] $Message"
-
+    $logMessage = "$timestamp [ $rawTag ] $message"
     if ($enableLogFile) {
         try {
-            Add-Content -Path $logFile -Value $logMessage -Encoding UTF8
+            Add-Content -Path $logFile -Value $logMessage -Encoding UTF8 -ErrorAction Stop
         }
-        catch { }
+        catch {
+            Write-Warning "Failed to write to log file: $($_.Exception.Message)"
+        }
     }
 
     Write-Host "$timestamp " -NoNewline
-    Write-Host "[  " -NoNewline -ForegroundColor White
+    Write-Host "[ " -NoNewline -ForegroundColor White
     Write-Host "$rawTag" -NoNewline -ForegroundColor $color
     Write-Host " ] " -NoNewline -ForegroundColor White
-    Write-Host "$Message"
+    Write-Host "$message"
 }
 
 # ---------------------------[ Exit Function ]---------------------------
@@ -117,16 +117,16 @@ function Complete-Script {
     $scriptEndTime = Get-Date
     $duration      = $scriptEndTime - $scriptStartTime
 
-    Write-Log "Script execution time: $($duration.ToString('hh\:mm\:ss\.ff'))" -Tag "Info"
-    Write-Log "Exit Code: $ExitCode" -Tag "Info"
-    Write-Log "======== Script Completed ========" -Tag "End"
+    Write-Log "Runtime $($duration.ToString('hh\:mm\:ss\.ff'))" -Tag "Info"
+    Write-Log "Exit $ExitCode" -Tag "Info"
+    Write-Log "==================== End ====================" -Tag "End"
 
     exit $ExitCode
 }
 
 # ---------------------------[ Script Start ]---------------------------
-Write-Log "======== Script Started ========" -Tag "Start"
-Write-Log "ComputerName: $env:COMPUTERNAME | User: $env:USERNAME | Script: $scriptName" -Tag "Info"
+Write-Log "==================== Start ====================" -Tag "Start"
+Write-Log "Host $env:COMPUTERNAME | $env:USERNAME | $scriptName" -Tag "Info"
 
 # ---------------------------[ Winget Path Resolver ]---------------------------
 function Get-WingetPath {
@@ -177,12 +177,12 @@ function Get-WingetPath {
             return $userPath
         }
 
-        Write-Log "Failed to detect Winget installation: no x64/arm64 folder or winget.exe found." -Tag "Error"
+        Write-Log "Winget: no DesktopAppInstaller / winget.exe" -Tag "Error"
         throw "Winget not found in system or user context"
     }
     catch {
         if ($_.Exception.Message -notlike 'Winget not found*') {
-            Write-Log "Failed to detect Winget installation: $_" -Tag "Error"
+            Write-Log "Winget resolve: $_" -Tag "Error"
         }
         throw "Winget not found in system or user context"
     }
@@ -193,7 +193,7 @@ function Test-Winget {
     [CmdletBinding()]
     param()
 
-    Write-Log "Checking Winget availability" -Tag "Get"
+    Write-Log "Winget check" -Tag "Get"
 
     try {
         $wingetPath = Get-WingetPath
@@ -203,24 +203,24 @@ function Test-Winget {
         if ($exitCode -eq 0) {
             $versionLine = $rawOutput | Where-Object { $_ -and ($_ -match '\d+\.\d+') } | Select-Object -First 1
             if ($versionLine -and $versionLine -match '(\d+\.\d+(?:\.\d+)?(?:\.\d+)?)') {
-                Write-Log "Winget version: $($matches[1])" -Tag "Success"
+                Write-Log "Winget OK: v$($matches[1])" -Tag "Success"
             }
             else {
-                Write-Log "Winget is available (execution successful)" -Tag "Success"
+                Write-Log "Winget OK" -Tag "Success"
             }
             return $true
         }
         else {
-            Write-Log "Winget execution failed with exit code: $exitCode" -Tag "Error"
+            Write-Log "Winget failed: exit $exitCode" -Tag "Error"
             $errorOutput = $rawOutput | Where-Object { $_ -and $_ -notmatch '^\s*$' } | Select-Object -First 3
             if ($errorOutput) {
-                Write-Log "Error details: $($errorOutput -join '; ')" -Tag "Debug"
+                Write-Log "Details: $($errorOutput -join '; ')" -Tag "Debug"
             }
             return $false
         }
     }
     catch {
-        Write-Log "Error testing Winget: $_" -Tag "Error"
+        Write-Log "Winget test: $_" -Tag "Error"
         return $false
     }
 }
@@ -318,7 +318,7 @@ function Get-AvailableUpdates {
     [CmdletBinding()]
     param()
 
-    Write-Log "Checking for available updates (no scope, then user, then machine)" -Tag "Get"
+    Write-Log "Upgrades: list (default, user, machine)" -Tag "Get"
     $wingetPath = Get-WingetPath
 
     try {
@@ -333,10 +333,10 @@ function Get-AvailableUpdates {
                 Out-String
             $parsed = ConvertFrom-WingetUpgradeOutput -RawOutput $upgradeResult -Scope $null
             foreach ($u in $parsed) { $allUpdates += $u }
-            Write-Log "No explicit scope: found $($parsed.Count) app(s) with updates" -Tag "Debug"
+            Write-Log "Upgrades default: $($parsed.Count)" -Tag "Debug"
         }
         catch {
-            Write-Log "Error getting updates (no scope): $_" -Tag "Debug"
+            Write-Log "List error (default): $_" -Tag "Debug"
         }
 
         try {
@@ -345,10 +345,10 @@ function Get-AvailableUpdates {
                 Out-String
             $parsed = ConvertFrom-WingetUpgradeOutput -RawOutput $upgradeResult -Scope 'user'
             foreach ($u in $parsed) { $allUpdates += $u }
-            Write-Log "User scope: found $($parsed.Count) app(s) with updates" -Tag "Debug"
+            Write-Log "Upgrades user: $($parsed.Count)" -Tag "Debug"
         }
         catch {
-            Write-Log "Error getting updates (user scope): $_" -Tag "Debug"
+            Write-Log "List error (user): $_" -Tag "Debug"
         }
 
         try {
@@ -357,10 +357,10 @@ function Get-AvailableUpdates {
                 Out-String
             $parsed = ConvertFrom-WingetUpgradeOutput -RawOutput $upgradeResult -Scope 'machine'
             foreach ($u in $parsed) { $allUpdates += $u }
-            Write-Log "Machine scope: found $($parsed.Count) app(s) with updates" -Tag "Debug"
+            Write-Log "Upgrades machine: $($parsed.Count)" -Tag "Debug"
         }
         catch {
-            Write-Log "Error getting updates (machine scope): $_" -Tag "Debug"
+            Write-Log "List error (machine): $_" -Tag "Debug"
         }
 
         $seen = @{}
@@ -372,12 +372,12 @@ function Get-AvailableUpdates {
             }
         }
 
-        Write-Log "Found $($updates.Count) unique apps with available updates" -Tag "Get"
+        Write-Log "Upgrades unique: $($updates.Count)" -Tag "Get"
         return $updates
     }
     catch {
-        Write-Log "Error getting available updates: $_" -Tag "Error"
-        Write-Log $_.ScriptStackTrace -Tag "Debug"
+        Write-Log "Get updates: $_" -Tag "Error"
+        Write-Log "$($_.ScriptStackTrace)" -Tag "Debug"
         return @()
     }
     finally {
@@ -411,7 +411,7 @@ function Select-FilteredUpdates {
 
     foreach ($update in $Updates) {
         if (-not $update -or -not $update.AppId) {
-            Write-Log "Invalid update object encountered, skipping" -Tag "Debug"
+            Write-Log "Invalid row; skip" -Tag "Debug"
             continue
         }
 
@@ -420,17 +420,18 @@ function Select-FilteredUpdates {
         if ($ListMode -eq 'Blacklist') {
             if ($null -ne $Blacklist -and $Blacklist.Count -gt 0) {
                 if (Test-AppMatch -AppId $appId -PatternList $Blacklist) {
-                    Write-Log "App excluded (blacklist): $appId" -Tag "Debug"
+                    Write-Log "Blacklist: skip $appId" -Tag "Debug"
                     continue
                 }
             }
         }
         elseif ($ListMode -eq 'Whitelist') {
             if ($null -eq $Whitelist -or $Whitelist.Count -eq 0) {
+                Write-Log "Whitelist empty; none" -Tag "Info"
                 return @()
             }
             if (-not (Test-AppMatch -AppId $appId -PatternList $Whitelist)) {
-                Write-Log "App excluded (not in whitelist): $appId" -Tag "Debug"
+                Write-Log "Whitelist: skip $appId" -Tag "Debug"
                 continue
             }
         }
@@ -438,56 +439,56 @@ function Select-FilteredUpdates {
         $filteredUpdates += $update
     }
 
-    Write-Log "Filtered to $($filteredUpdates.Count) apps requiring updates" -Tag "Get"
+    Write-Log "Filtered: $($filteredUpdates.Count)" -Tag "Get"
     return $filteredUpdates
 }
 
 # ---------------------------[ Main Detection Logic ]---------------------------
 try {
     if (-not (Test-Winget)) {
-        Write-Log "Winget is not available; detection cannot proceed." -Tag "Error"
-        Complete-Script -ExitCode 1
+        Write-Log "Winget unavailable." -Tag "Error"
+        Complete-Script -ExitCode 0 # If WingGet isn't available, we shall not remediate.
     }
 
     # Get available updates
     $availableUpdates = Get-AvailableUpdates
 
     if ($availableUpdates.Count -eq 0) {
-        Write-Log "No updates available - all apps are up to date" -Tag "Success"
+        Write-Log "No upgrades" -Tag "Success"
         Complete-Script -ExitCode 0
     }
 
     if ($listMode -eq 'Blacklist') {
         $listCount = if ($null -ne $blacklistApps) { $blacklistApps.Count } else { 0 }
-        Write-Log "Using blacklist mode with $listCount entries" -Tag "Info"
+        Write-Log "Mode: blacklist ($listCount)" -Tag "Info"
     }
     else {
         $listCount = if ($null -ne $whitelistApps) { $whitelistApps.Count } else { 0 }
-        Write-Log "Using whitelist mode with $listCount entries" -Tag "Info"
+        Write-Log "Mode: whitelist ($listCount)" -Tag "Info"
     }
 
     $filteredUpdates = Select-FilteredUpdates -Updates $availableUpdates -ListMode $listMode -Blacklist $blacklistApps -Whitelist $whitelistApps
 
     if ($filteredUpdates.Count -eq 0) {
-        Write-Log "No updates needed after filtering - all managed apps are up to date" -Tag "Success"
+        Write-Log "No upgrades after filter" -Tag "Success"
         Complete-Script -ExitCode 0
     }
 
-    Write-Log "Apps requiring updates:" -Tag "Info"
+    Write-Log "Pending:" -Tag "Info"
     foreach ($update in $filteredUpdates) {
         $scopeTag = switch ($update.Scope) {
             'user' { ' [user]' }
             'machine' { ' [machine]' }
             default { '' }
         }
-        Write-Log "  - $($update.AppId): $($update.CurrentVersion) -> $($update.AvailableVersion)$scopeTag" -Tag "Info"
+        Write-Log "  $($update.AppId) $($update.CurrentVersion)->$($update.AvailableVersion)$scopeTag" -Tag "Info"
     }
 
-    Write-Log "Detection complete: $($filteredUpdates.Count) app(s) need updating" -Tag "Success"
+    Write-Log "Detect: $($filteredUpdates.Count) non-compliant" -Tag "Success"
     Complete-Script -ExitCode 1
 }
 catch {
-    Write-Log "Unexpected error in detection script: $_" -Tag "Error"
-    Write-Log $_.ScriptStackTrace -Tag "Debug"
+    Write-Log "Unhandled: $_" -Tag "Error"
+    Write-Log "$($_.ScriptStackTrace)" -Tag "Debug"
     Complete-Script -ExitCode 1
 }
