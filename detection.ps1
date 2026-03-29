@@ -245,8 +245,8 @@ function Test-AppMatch {
     return $false
 }
 
-# ---------------------------[ Parse Winget Upgrade Output ]---------------------------
-function Parse-WingetUpgradeOutput {
+# ---------------------------[ Convert Winget Upgrade Output ]---------------------------
+function ConvertFrom-WingetUpgradeOutput {
     [CmdletBinding()]
     param(
         [string]$RawOutput,
@@ -313,12 +313,12 @@ function Parse-WingetUpgradeOutput {
 }
 
 # ---------------------------[ Get Available Updates ]---------------------------
-# Two calls: without --scope (machine apps by default) + with --scope user (additional user apps)
+# Three calls: no --scope, then --scope user, then --scope machine. Union by AppId (first-seen wins).
 function Get-AvailableUpdates {
     [CmdletBinding()]
     param()
 
-    Write-Log "Checking for available updates (default + user scope)" -Tag "Get"
+    Write-Log "Checking for available updates (no scope, then user, then machine)" -Tag "Get"
     $wingetPath = Get-WingetPath
 
     try {
@@ -327,25 +327,23 @@ function Get-AvailableUpdates {
 
         $allUpdates = @()
 
-        # Call 1: no --scope flag (returns machine-scoped apps by default)
         try {
             $upgradeResult = & $wingetPath upgrade --source winget |
                 Where-Object { $_ -notlike " *" } |
                 Out-String
-            $parsed = Parse-WingetUpgradeOutput -RawOutput $upgradeResult -Scope $null
+            $parsed = ConvertFrom-WingetUpgradeOutput -RawOutput $upgradeResult -Scope $null
             foreach ($u in $parsed) { $allUpdates += $u }
-            Write-Log "Default scope: found $($parsed.Count) app(s) with updates" -Tag "Debug"
+            Write-Log "No explicit scope: found $($parsed.Count) app(s) with updates" -Tag "Debug"
         }
         catch {
-            Write-Log "Error getting updates (default scope): $_" -Tag "Debug"
+            Write-Log "Error getting updates (no scope): $_" -Tag "Debug"
         }
 
-        # Call 2: --scope user (returns additional user-scoped apps)
         try {
             $upgradeResult = & $wingetPath upgrade --source winget --scope user |
                 Where-Object { $_ -notlike " *" } |
                 Out-String
-            $parsed = Parse-WingetUpgradeOutput -RawOutput $upgradeResult -Scope 'user'
+            $parsed = ConvertFrom-WingetUpgradeOutput -RawOutput $upgradeResult -Scope 'user'
             foreach ($u in $parsed) { $allUpdates += $u }
             Write-Log "User scope: found $($parsed.Count) app(s) with updates" -Tag "Debug"
         }
@@ -353,7 +351,18 @@ function Get-AvailableUpdates {
             Write-Log "Error getting updates (user scope): $_" -Tag "Debug"
         }
 
-        # Deduplicate by AppId (prefer non-user scope if same app appears in both)
+        try {
+            $upgradeResult = & $wingetPath upgrade --source winget --scope machine |
+                Where-Object { $_ -notlike " *" } |
+                Out-String
+            $parsed = ConvertFrom-WingetUpgradeOutput -RawOutput $upgradeResult -Scope 'machine'
+            foreach ($u in $parsed) { $allUpdates += $u }
+            Write-Log "Machine scope: found $($parsed.Count) app(s) with updates" -Tag "Debug"
+        }
+        catch {
+            Write-Log "Error getting updates (machine scope): $_" -Tag "Debug"
+        }
+
         $seen = @{}
         $updates = @()
         foreach ($u in $allUpdates) {
@@ -466,7 +475,11 @@ try {
 
     Write-Log "Apps requiring updates:" -Tag "Info"
     foreach ($update in $filteredUpdates) {
-        $scopeTag = if ($update.Scope -eq 'user') { ' [user]' } else { '' }
+        $scopeTag = switch ($update.Scope) {
+            'user' { ' [user]' }
+            'machine' { ' [machine]' }
+            default { '' }
+        }
         Write-Log "  - $($update.AppId): $($update.CurrentVersion) -> $($update.AvailableVersion)$scopeTag" -Tag "Info"
     }
 

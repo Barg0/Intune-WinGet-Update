@@ -66,6 +66,15 @@ $logFile          = "$logFileDirectory\$logFileName"
 #   RetryScope - No applicable installer for scope; retry with --scope user (if user-scoped app).
 #   RetryLater - Transient (app in use, disk full, reboot, network). Defer to next Intune cycle.
 #   Fail       - Unrecoverable in automation (policy block, hash mismatch, unsupported).
+#
+# WinGet often returns signed 32-bit HRESULTs (negative). Do not cast those directly to
+# [uint32] for hex display — it throws. Reinterpret bits via BitConverter instead.
+function Format-WingetExitCodeHex {
+    param([int]$Code)
+    $u = [System.BitConverter]::ToUInt32([System.BitConverter]::GetBytes([int32]$Code), 0)
+    return ('0x{0:X8}' -f $u)
+}
+
 function Get-WingetExitCodeInfo {
     [CmdletBinding()]
     param([int]$ExitCode)
@@ -78,6 +87,9 @@ function Get-WingetExitCodeInfo {
         -1978334962    = @{ Category = 'Success';    Description = 'Higher version already installed (downgrade)' }        # 0x8A15010E
         -1978334965    = @{ Category = 'Success';    Description = 'Reboot initiated to finish installation' }             # 0x8A15010B
         -1978335189    = @{ Category = 'Success';    Description = 'No applicable update found' }                          # 0x8A15002B
+
+        # INSTALL_CANCELLED_BY_USER (0x8A15010C) — mapped in Intune-WinGet install.ps1; silent upgrades may still surface it from the installer
+        -1978334964    = @{ Category = 'Fail';       Description = 'Installation cancelled by user' }                       # 0x8A15010C
 
         # ── RetryScope: retry with --scope user (for user-detected apps) ──
         -1978335216    = @{ Category = 'RetryScope'; Description = 'No applicable installer for current scope' }           # 0x8A150010
@@ -134,7 +146,8 @@ function Get-WingetExitCodeInfo {
         -1978334956    = @{ Category = 'Fail'; Description = 'Installer does not support upgrading existing package' }      # 0x8A150114
     }
     if ($codeMap.ContainsKey($ExitCode)) { return $codeMap[$ExitCode] }
-    return @{ Category = 'Unknown'; Description = "Unmapped exit code $ExitCode (hex: 0x$( '{0:X8}' -f [uint32]$ExitCode ))" }
+    $hex = Format-WingetExitCodeHex -Code $ExitCode
+    return @{ Category = 'Unknown'; Description = "Unmapped exit code $ExitCode ($hex)" }
 }
 
 if ($enableLogFile -and -not (Test-Path -Path $logFileDirectory)) {
@@ -194,9 +207,28 @@ function Write-Log {
     Write-Host "$Message"
 }
 
+# One-line summary for Intune portal (last console line). Not written to the log file.
+function Build-RemediationPortalSummaryLine {
+    param(
+        [string[]]$Succeeded = @(),
+        [string[]]$Failed = @(),
+        [string[]]$Deferred = @()
+    )
+    $okList  = if (@($Succeeded).Count -gt 0) { @($Succeeded) -join ', ' } else { '(none)' }
+    $badList = if (@($Failed).Count -gt 0) { @($Failed) -join ', ' } else { '(none)' }
+    $line    = "Updated: $okList | Failed: $badList"
+    if (@($Deferred).Count -gt 0) {
+        $line += " | Deferred: $(@($Deferred) -join ', ')"
+    }
+    return $line
+}
+
 # ---------------------------[ Exit Function ]---------------------------
 function Complete-Script {
-    param([int]$ExitCode)
+    param(
+        [int]$ExitCode,
+        [string]$PortalSummaryLine = $null
+    )
 
     $scriptEndTime = Get-Date
     $duration      = $scriptEndTime - $scriptStartTime
@@ -204,6 +236,10 @@ function Complete-Script {
     Write-Log "Script execution time: $($duration.ToString('hh\:mm\:ss\.ff'))" -Tag "Info"
     Write-Log "Exit Code: $ExitCode" -Tag "Info"
     Write-Log "======== Script Completed ========" -Tag "End"
+
+    if (-not [string]::IsNullOrEmpty($PortalSummaryLine)) {
+        Write-Host $PortalSummaryLine
+    }
 
     exit $ExitCode
 }
@@ -344,8 +380,8 @@ function Test-AppMatch {
     return $false
 }
 
-# ---------------------------[ Parse Winget Upgrade Output ]---------------------------
-function Parse-WingetUpgradeOutput {
+# ---------------------------[ Convert Winget Upgrade Output ]---------------------------
+function ConvertFrom-WingetUpgradeOutput {
     [CmdletBinding()]
     param(
         [string]$RawOutput,
@@ -412,12 +448,13 @@ function Parse-WingetUpgradeOutput {
 }
 
 # ---------------------------[ Get Available Updates ]---------------------------
-# Two calls: without --scope (machine apps by default) + with --scope user (additional user apps)
+# Three calls: no --scope, then --scope user, then --scope machine. Union by AppId (first-seen wins
+# for metadata: default list, then user-only additions, then machine-only additions).
 function Get-AvailableUpdates {
     [CmdletBinding()]
     param()
 
-    Write-Log "Checking for available updates (default + user scope)" -Tag "Get"
+    Write-Log "Checking for available updates (no scope, then user, then machine)" -Tag "Get"
     $wingetPath = Get-WingetPath
 
     try {
@@ -426,25 +463,25 @@ function Get-AvailableUpdates {
 
         $allUpdates = @()
 
-        # Call 1: no --scope flag (returns machine-scoped apps by default)
+        # Call 1: no --scope (winget default)
         try {
             $upgradeResult = & $wingetPath upgrade --source winget |
                 Where-Object { $_ -notlike " *" } |
                 Out-String
-            $parsed = Parse-WingetUpgradeOutput -RawOutput $upgradeResult -Scope $null
+            $parsed = ConvertFrom-WingetUpgradeOutput -RawOutput $upgradeResult -Scope $null
             foreach ($u in $parsed) { $allUpdates += $u }
-            Write-Log "Default scope: found $($parsed.Count) app(s) with updates" -Tag "Debug"
+            Write-Log "No explicit scope: found $($parsed.Count) app(s) with updates" -Tag "Debug"
         }
         catch {
-            Write-Log "Error getting updates (default scope): $_" -Tag "Debug"
+            Write-Log "Error getting updates (no scope): $_" -Tag "Debug"
         }
 
-        # Call 2: --scope user (returns additional user-scoped apps)
+        # Call 2: --scope user
         try {
             $upgradeResult = & $wingetPath upgrade --source winget --scope user |
                 Where-Object { $_ -notlike " *" } |
                 Out-String
-            $parsed = Parse-WingetUpgradeOutput -RawOutput $upgradeResult -Scope 'user'
+            $parsed = ConvertFrom-WingetUpgradeOutput -RawOutput $upgradeResult -Scope 'user'
             foreach ($u in $parsed) { $allUpdates += $u }
             Write-Log "User scope: found $($parsed.Count) app(s) with updates" -Tag "Debug"
         }
@@ -452,7 +489,19 @@ function Get-AvailableUpdates {
             Write-Log "Error getting updates (user scope): $_" -Tag "Debug"
         }
 
-        # Deduplicate by AppId (prefer non-user scope if same app appears in both)
+        # Call 3: --scope machine
+        try {
+            $upgradeResult = & $wingetPath upgrade --source winget --scope machine |
+                Where-Object { $_ -notlike " *" } |
+                Out-String
+            $parsed = ConvertFrom-WingetUpgradeOutput -RawOutput $upgradeResult -Scope 'machine'
+            foreach ($u in $parsed) { $allUpdates += $u }
+            Write-Log "Machine scope: found $($parsed.Count) app(s) with updates" -Tag "Debug"
+        }
+        catch {
+            Write-Log "Error getting updates (machine scope): $_" -Tag "Debug"
+        }
+
         $seen = @{}
         $updates = @()
         foreach ($u in $allUpdates) {
@@ -534,14 +583,12 @@ function Select-FilteredUpdates {
 }
 
 # ---------------------------[ Update Application ]---------------------------
-# Upgrade flow:
-#   1. Try winget upgrade without --scope (let winget auto-detect)
-#   2. In-progress wait loop: if another install is running, wait 30s and retry (up to 5x)
-#   3. RetryScope: if "no applicable installer" and app was detected as user-scoped,
-#      retry once with --scope user
-#   4. RetryLater: transient errors (disk full, no network, app running) return $null
-#      so Intune retries next cycle instead of flagging a failure
-#   5. Fail: unrecoverable errors return $false
+# Upgrade flow (unchanged): discovery may list extra apps via user/machine winget passes, but upgrade
+# still uses: no --scope first, then --scope user only on RetryScope when detection tagged the app as user.
+#   1. Try winget upgrade without --scope
+#   2. In-progress wait loop (up to 5x)
+#   3. RetryScope + detection Scope 'user': retry once with --scope user
+#   4. RetryLater -> $null; Fail / Unknown -> $false
 function Update-Application {
     [CmdletBinding()]
     param(
@@ -570,7 +617,6 @@ function Update-Application {
     }
 
     try {
-        # ── Attempt 1: upgrade without --scope ──
         $inProgressCount = 0
         do {
             if ($inProgressCount -gt 0) {
@@ -593,13 +639,11 @@ function Update-Application {
 
         $exitInfo = Get-WingetExitCodeInfo -ExitCode $exitCode
 
-        # ── Success ──
         if ($exitInfo.Category -eq 'Success') {
             Write-Log "Successfully updated: $AppId" -Tag "Success"
             return $true
         }
 
-        # ── RetryScope: if "no applicable installer" and the app was detected as user-scoped ──
         if ($exitInfo.Category -eq 'RetryScope' -and $Scope -eq 'user') {
             Write-Log "No applicable installer without scope; retrying $AppId with --scope user." -Tag "Info"
 
@@ -615,13 +659,11 @@ function Update-Application {
             Write-Log "Retry with --scope user failed for $AppId - $exitCode ($($exitInfo.Description))" -Tag "Debug"
         }
 
-        # ── RetryLater: transient ──
         if ($exitInfo.Category -eq 'RetryLater') {
             Write-Log "Transient error for $AppId ($($exitInfo.Description)); will retry next Intune cycle." -Tag "Info"
             return $null
         }
 
-        # ── Fail / Unknown ──
         $errorMessages = $upgradeOutput | Where-Object {
             $_ -match 'error|failed|exception|unable|cannot|could not' -or
             ($_ -match '^[A-Z]' -and $_ -notmatch '^Loading|^Found|^Verifying|^Successfully')
@@ -643,7 +685,7 @@ function Update-Application {
 try {
     if (-not (Test-Winget)) {
         Write-Log "Winget is not available or not working properly." -Tag "Error"
-        Complete-Script -ExitCode 1
+        Complete-Script -ExitCode 1 -PortalSummaryLine 'Winget-AppUpdate | Updated: (none) | Failed: (none) | Winget unavailable'
     }
 
     # One-time source refresh before we start
@@ -661,7 +703,7 @@ try {
 
     if ($availableUpdates.Count -eq 0) {
         Write-Log "No updates available - all apps are up to date" -Tag "Success"
-        Complete-Script -ExitCode 0
+        Complete-Script -ExitCode 0 -PortalSummaryLine (Build-RemediationPortalSummaryLine)
     }
 
     if ($listMode -eq 'Blacklist') {
@@ -677,7 +719,7 @@ try {
 
     if ($filteredUpdates.Count -eq 0) {
         Write-Log "No updates needed after filtering - all managed apps are up to date" -Tag "Success"
-        Complete-Script -ExitCode 0
+        Complete-Script -ExitCode 0 -PortalSummaryLine (Build-RemediationPortalSummaryLine)
     }
 
     # Perform updates
@@ -686,6 +728,7 @@ try {
     $successCount   = 0
     $failureCount   = 0
     $deferredCount  = 0
+    $succeededApps  = @()
     $failedApps     = @()
     $deferredApps   = @()
 
@@ -705,6 +748,7 @@ try {
 
         if ($result -eq $true) {
             $successCount++
+            $succeededApps += $update.AppId
         }
         elseif ($null -eq $result) {
             $deferredCount++
@@ -725,17 +769,19 @@ try {
         Write-Log "Deferred (transient): $deferredCount application(s) - $($deferredApps -join ', ')" -Tag "Info"
     }
 
+    $portalLine = Build-RemediationPortalSummaryLine -Succeeded $succeededApps -Failed $failedApps -Deferred $deferredApps
+
     if ($failureCount -gt 0) {
         Write-Log "Failed to update: $failureCount application(s) - $($failedApps -join ', ')" -Tag "Error"
-        Complete-Script -ExitCode 1
+        Complete-Script -ExitCode 1 -PortalSummaryLine $portalLine
     }
     else {
         Write-Log "All updates completed or deferred successfully" -Tag "Success"
-        Complete-Script -ExitCode 0
+        Complete-Script -ExitCode 0 -PortalSummaryLine $portalLine
     }
 }
 catch {
     Write-Log "Unexpected error in remediation script: $_" -Tag "Error"
     Write-Log $_.ScriptStackTrace -Tag "Debug"
-    Complete-Script -ExitCode 1
+    Complete-Script -ExitCode 1 -PortalSummaryLine 'Winget-AppUpdate | Updated: (unknown) | Failed: (unknown) | Script error - see remediation.log'
 }
