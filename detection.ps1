@@ -193,7 +193,7 @@ function Test-Winget {
     [CmdletBinding()]
     param()
 
-    Write-Log "Winget check" -Tag "Get"
+    Write-Log "WinGet check" -Tag "Debug"
 
     try {
         $wingetPath = Get-WingetPath
@@ -203,10 +203,10 @@ function Test-Winget {
         if ($exitCode -eq 0) {
             $versionLine = $rawOutput | Where-Object { $_ -and ($_ -match '\d+\.\d+') } | Select-Object -First 1
             if ($versionLine -and $versionLine -match '(\d+\.\d+(?:\.\d+)?(?:\.\d+)?)') {
-                Write-Log "Winget OK: v$($matches[1])" -Tag "Success"
+                Write-Log "WinGet: v$($matches[1])" -Tag "Success"
             }
             else {
-                Write-Log "Winget OK" -Tag "Success"
+                Write-Log "WinGet" -Tag "Success"
             }
             return $true
         }
@@ -246,6 +246,8 @@ function Test-AppMatch {
 }
 
 # ---------------------------[ Convert Winget Upgrade Output ]---------------------------
+# Returns use `return , $updates` so a single row stays Object[]; otherwise PowerShell unwraps
+# one hashtable and .Count becomes the number of keys (5), not the number of apps.
 function ConvertFrom-WingetUpgradeOutput {
     [CmdletBinding()]
     param(
@@ -257,7 +259,7 @@ function ConvertFrom-WingetUpgradeOutput {
     $unknownCount = 0
 
     if (-not ($RawOutput -match "-----")) {
-        return $updates
+        return , $updates
     }
 
     $lines = $RawOutput.Split([Environment]::NewLine) | Where-Object { $_ }
@@ -267,12 +269,12 @@ function ConvertFrom-WingetUpgradeOutput {
 
     $fl = 0
     while ($fl -lt $lines.Count -and -not $lines[$fl].StartsWith("-----")) { $fl++ }
-    if ($fl -ge $lines.Count) { return $updates }
+    if ($fl -ge $lines.Count) { return , $updates }
     $fl = $fl - 1
-    if ($fl -lt 0) { return $updates }
+    if ($fl -lt 0) { return , $updates }
 
     $index = $lines[$fl] -split '(?<=\s)(?!\s)'
-    if ($index.Count -lt 3) { return $updates }
+    if ($index.Count -lt 3) { return , $updates }
 
     $idStart = $($index[0] -replace '[\u4e00-\u9fa5]', '**').Length
     $versionStart = $idStart + $($index[1] -replace '[\u4e00-\u9fa5]', '**').Length
@@ -309,7 +311,7 @@ function ConvertFrom-WingetUpgradeOutput {
             }
         }
     }
-    return $updates
+    return , $updates
 }
 
 # ---------------------------[ Get Available Updates ]---------------------------
@@ -318,7 +320,7 @@ function Get-AvailableUpdates {
     [CmdletBinding()]
     param()
 
-    Write-Log "Upgrades: list (default, user, machine)" -Tag "Get"
+    Write-Log "Upgrades: list (default, user, machine)" -Tag "Debug"
     $wingetPath = Get-WingetPath
 
     try {
@@ -372,13 +374,13 @@ function Get-AvailableUpdates {
             }
         }
 
-        Write-Log "Upgrades unique: $($updates.Count)" -Tag "Get"
-        return $updates
+        Write-Log "Upgrades: $($updates.Count)" -Tag "Get"
+        return , $updates
     }
     catch {
         Write-Log "Get updates: $_" -Tag "Error"
         Write-Log "$($_.ScriptStackTrace)" -Tag "Debug"
-        return @()
+        return , @()
     }
     finally {
         [Console]::OutputEncoding = $previousOutputEncoding
@@ -403,8 +405,12 @@ function Select-FilteredUpdates {
         [string[]]$Whitelist = @()
     )
 
-    if ($null -eq $Updates -or $Updates.Count -eq 0) {
-        return @()
+    if ($null -eq $Updates) {
+        return , @()
+    }
+    $Updates = @($Updates)
+    if ($Updates.Count -eq 0) {
+        return , @()
     }
 
     $filteredUpdates = @()
@@ -428,7 +434,7 @@ function Select-FilteredUpdates {
         elseif ($ListMode -eq 'Whitelist') {
             if ($null -eq $Whitelist -or $Whitelist.Count -eq 0) {
                 Write-Log "Whitelist empty; none" -Tag "Info"
-                return @()
+                return , @()
             }
             if (-not (Test-AppMatch -AppId $appId -PatternList $Whitelist)) {
                 Write-Log "Whitelist: skip $appId" -Tag "Debug"
@@ -440,7 +446,7 @@ function Select-FilteredUpdates {
     }
 
     Write-Log "Filtered: $($filteredUpdates.Count)" -Tag "Get"
-    return $filteredUpdates
+    return , $filteredUpdates
 }
 
 # ---------------------------[ Main Detection Logic ]---------------------------
@@ -474,14 +480,14 @@ try {
         Complete-Script -ExitCode 0
     }
 
-    Write-Log "Pending:" -Tag "Info"
+    Write-Log "Available:" -Tag "Info"
     foreach ($update in $filteredUpdates) {
         $scopeTag = switch ($update.Scope) {
             'user' { ' [user]' }
             'machine' { ' [machine]' }
             default { '' }
         }
-        Write-Log "  $($update.AppId) $($update.CurrentVersion)->$($update.AvailableVersion)$scopeTag" -Tag "Info"
+        Write-Log "  $($update.AppId) $($update.CurrentVersion) -> $($update.AvailableVersion)$scopeTag" -Tag "Info"
     }
 
     Write-Log "Detect: $($filteredUpdates.Count) non-compliant" -Tag "Success"
