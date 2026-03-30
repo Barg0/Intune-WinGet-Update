@@ -42,6 +42,11 @@ $whitelistApps = @(
 # run the same ladder once more with `winget upgrade ... --locale <this>` (manifest/installer locale). Empty string disables.
 $wingetLocaleWorkaround = 'en-US'
 
+# When WinGet returns INSTALL_IN_PROGRESS (0x8A150102 / -1978334974), wait and re-run the same upgrade attempt.
+# Defaults match https://github.com/Barg0/Intune-WinGet/blob/main/templates/install.ps1 ($maxInProgressRetries / $inProgressDelaySeconds).
+$wingetInProgressMaxRetries  = 15
+$wingetInProgressWaitSeconds = 120
+
 # ---------------------------[ Script Start Timestamp ]---------------------------
 $scriptStartTime = Get-Date
 
@@ -67,7 +72,7 @@ $logFile          = "$logFileDirectory\$logFileName"
 #
 # Categories drive the retry engine:
 #   Success    - Desired state reached. No action needed.
-#   RetryScope - No applicable installer for scope; retry with --scope user (if user-scoped app).
+#   RetryScope - No applicable installer / no packages for scope; advance upgrade ladder (machine → default → user).
 #   RetryLater - Transient (app in use, disk full, reboot, network). Defer to next Intune cycle.
 #   Fail       - Unrecoverable in automation (policy block, hash mismatch, unsupported).
 #
@@ -96,8 +101,9 @@ function Get-WingetExitCodeInfo {
         # INSTALL_CANCELLED_BY_USER (0x8A15010C) — mapped in Intune-WinGet install.ps1; silent upgrades may still surface it from the installer
         -1978334964    = @{ Category = 'Fail';       Description = 'Installation cancelled by user' }                       # 0x8A15010C
 
-        # ── RetryScope: retry with --scope user (for user-detected apps) ──
+        # ── RetryScope: advance upgrade ladder (machine → default → user); aligned with Barg0/Intune-WinGet install.ps1
         -1978335216    = @{ Category = 'RetryScope'; Description = 'No applicable installer for current scope' }           # 0x8A150010
+        -1978335212    = @{ Category = 'RetryScope'; Description = 'No packages found' }                                   # 0x8A150014 NO_APPLICATIONS_FOUND
 
         # ── RetryLater: transient – defer to next Intune cycle ──
         -1978334975    = @{ Category = 'RetryLater'; Description = 'Application is currently running' }                    # 0x8A150101
@@ -125,7 +131,6 @@ function Get-WingetExitCodeInfo {
         -1978335221    = @{ Category = 'Fail'; Description = 'Configured source information is corrupt' }                  # 0x8A15000B
         -1978335217    = @{ Category = 'Fail'; Description = 'Source data missing' }                                       # 0x8A15000F
         -1978335215    = @{ Category = 'Fail'; Description = 'Installer hash does not match manifest' }                    # 0x8A150011
-        -1978335212    = @{ Category = 'Fail'; Description = 'No packages found' }                                         # 0x8A150014
         -1978335210    = @{ Category = 'Fail'; Description = 'Multiple packages found matching criteria' }                 # 0x8A150016
         -1978335209    = @{ Category = 'Fail'; Description = 'No manifest found matching criteria' }                       # 0x8A150017
         -1978335207    = @{ Category = 'Fail'; Description = 'Command requires administrator privileges' }                 # 0x8A150019
@@ -315,18 +320,51 @@ function Get-WingetPath {
 }
 
 # ---------------------------[ Test Pending Reboot ]---------------------------
+# Same checks as https://github.com/Barg0/Intune-Win32-Scripts/blob/main/installExe.ps1 (Test-PendingReboot).
+# Log-only here; script does not exit on pending reboot.
 function Test-PendingReboot {
-    try {
-        $paths = @(
-            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
-            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
-        )
-        foreach ($p in $paths) { if (Test-Path $p) { return $true } }
-        $pn = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
-        if ($pn -and $pn.PendingFileRenameOperations) { return $true }
-        return $false
+    [CmdletBinding()]
+    param()
+
+    $rebootKeys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootInProgress',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
+        'HKLM:\SOFTWARE\Microsoft\ServerManager\CurrentRebootAttempts'
+    )
+    foreach ($key in $rebootKeys) {
+        if (Test-Path -Path $key) { return $true }
     }
-    catch { return $false }
+
+    $sessionManagerPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+    if (Test-Path -Path $sessionManagerPath) {
+        $pfro = Get-ItemProperty -Path $sessionManagerPath -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
+        if ($pfro -and $pfro.PendingFileRenameOperations) { return $true }
+        $pfro2 = Get-ItemProperty -Path $sessionManagerPath -Name 'PendingFileRenameOperations2' -ErrorAction SilentlyContinue
+        if ($pfro2 -and $pfro2.PendingFileRenameOperations2) { return $true }
+    }
+
+    $updatePaths = @(
+        'HKLM:\SOFTWARE\Microsoft\Updates',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Updates'
+    )
+    foreach ($updatePath in $updatePaths) {
+        if (Test-Path -Path $updatePath) {
+            $volatile = Get-ItemProperty -Path $updatePath -Name 'UpdateExeVolatile' -ErrorAction SilentlyContinue
+            if ($volatile -and $volatile.UpdateExeVolatile -ne 0) { return $true }
+        }
+    }
+
+    $computerNamePath = 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName'
+    $activeNamePath = 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName'
+    if ((Test-Path -Path $computerNamePath) -and (Test-Path -Path $activeNamePath)) {
+        $computerName = (Get-ItemProperty -Path $computerNamePath -Name 'ComputerName' -ErrorAction SilentlyContinue).ComputerName
+        $activeName = (Get-ItemProperty -Path $activeNamePath -Name 'ComputerName' -ErrorAction SilentlyContinue).ComputerName
+        if ($computerName -and $activeName -and $computerName -ne $activeName) { return $true }
+    }
+
+    return $false
 }
 
 # ---------------------------[ Test Winget Function ]---------------------------
@@ -606,12 +644,14 @@ function Test-WingetUpgradeOutputClaimsNoApplicable {
 }
 
 # ---------------------------[ Update Application ]---------------------------
-#   1. `winget upgrade` without --scope (+ in-progress wait loop)
-#   2. If RetryScope, 0x8A15002B, or output says no applicable upgrade: one retry with --scope user
-#   3. Success only if exit category Success AND output does not claim no applicable upgrade (guards false exit 0)
-#   4. RetryLater -> $null
-#   5. If still failing with 0x8A150014 (No packages found) and $wingetLocaleWorkaround is set: repeat steps 1–2 with `--locale` (same pattern as scope retry)
-#   6. Else Fail -> $false
+# Upgrade ladder (same spirit as https://github.com/Barg0/Intune-WinGet/blob/main/templates/install.ps1 — machine first, then relax scope):
+#   1. `winget upgrade --scope machine` (+ in-progress wait loop on INSTALL_IN_PROGRESS)
+#   2. If RetryScope, 0x8A15002B, 0x8A150014, or output says no applicable upgrade: retry without `--scope` (WinGet default)
+#   3. If still RetryScope / 0x8A15002B / same output heuristic: retry `--scope user`
+#   4. Success only if exit category Success AND output does not claim no applicable upgrade (guards false exit 0)
+#   5. RetryLater -> $null
+#   6. If locale pass 0 still ends with 0x8A150014 and $wingetLocaleWorkaround is set: repeat steps 1–3 with `--locale`
+#   7. Else Fail -> $false
 function Update-Application {
     [CmdletBinding()]
     param(
@@ -622,24 +662,26 @@ function Update-Application {
         [string]$WingetPath
     )
 
-    $maxInProgressRetries   = 5
-    $inProgressDelaySeconds = 30
-
     function Invoke-Upgrade {
         param(
-            [bool]$WithScopeUser,
+            [ValidateSet('Machine', 'Default', 'User')]
+            [string]$ScopeMode,
+
             [string]$Locale
         )
         $wingetArgs = @('upgrade', '--id', $AppId, '-e', '--accept-package-agreements', '--accept-source-agreements', '-h', '--source', 'winget')
         if (-not [string]::IsNullOrWhiteSpace($Locale)) { $wingetArgs += '--locale', $Locale.Trim() }
-        if ($WithScopeUser) { $wingetArgs += '--scope', 'user' }
+        if ($ScopeMode -eq 'Machine') { $wingetArgs += '--scope', 'machine' }
+        elseif ($ScopeMode -eq 'User') { $wingetArgs += '--scope', 'user' }
         Write-Log "winget $($wingetArgs -join ' ')" -Tag "Debug"
         & $WingetPath @wingetArgs 2>&1 | Where-Object { $_ -notlike " *" }
     }
 
     function Invoke-UpgradeWithInProgressWait {
         param(
-            [bool]$WithScopeUser,
+            [ValidateSet('Machine', 'Default', 'User')]
+            [string]$ScopeMode,
+
             [string]$Locale
         )
         $inProgressCount = 0
@@ -647,16 +689,25 @@ function Update-Application {
         $exitCode = 0
         do {
             if ($inProgressCount -gt 0) {
-                Write-Log "Install busy; wait ${inProgressDelaySeconds}s ($inProgressCount/$maxInProgressRetries)" -Tag "Info"
-                Start-Sleep -Seconds $inProgressDelaySeconds
+                Write-Log "Install busy; wait ${wingetInProgressWaitSeconds}s ($inProgressCount/$wingetInProgressMaxRetries)" -Tag "Info"
+                Start-Sleep -Seconds $wingetInProgressWaitSeconds
             }
-            $upgradeOutput = Invoke-Upgrade -WithScopeUser $WithScopeUser -Locale $Locale
+            $upgradeOutput = Invoke-Upgrade -ScopeMode $ScopeMode -Locale $Locale
             $exitCode = $LASTEXITCODE
             if ($null -eq $upgradeOutput) { $upgradeOutput = @() }
             if ($exitCode -ne -1978334974) { break }
             $inProgressCount++
-        } while ($inProgressCount -le $maxInProgressRetries)
+        } while ($inProgressCount -le $wingetInProgressMaxRetries)
         return @{ Output = $upgradeOutput; ExitCode = $exitCode }
+    }
+
+    function Test-ShouldAdvanceScopeLadder {
+        param(
+            $ExitInfo,
+            [int]$ExitCode,
+            [bool]$OutputClaimsNoApplicable
+        )
+        return ($ExitInfo.Category -eq 'RetryScope') -or ($ExitCode -eq -1978335189) -or $OutputClaimsNoApplicable
     }
 
     try {
@@ -670,12 +721,13 @@ function Update-Application {
 
             $successNote = if ($localePass -eq 0) { '' } else { ' (locale workaround)' }
 
-            $first = Invoke-UpgradeWithInProgressWait -WithScopeUser $false -Locale $localeArg
+            # 1) --scope machine (system-context upgrades; matches Intune-WinGet install.ps1 defaultScope machine)
+            $first = Invoke-UpgradeWithInProgressWait -ScopeMode Machine -Locale $localeArg
             $upgradeOutput = $first.Output
             $exitCode = $first.ExitCode
 
             if ($exitCode -eq -1978334974) {
-                Write-Log "Install still busy: $AppId" -Tag "Info"
+                Write-Log "Defer ${AppId}: install busy (max waits)" -Tag "Info"
                 return $null
             }
 
@@ -685,7 +737,7 @@ function Update-Application {
             $treatAsSuccess = ($exitInfo.Category -eq 'Success') -and -not $outputClaimsNoApplicable
 
             if ($treatAsSuccess) {
-                Write-Log "$AppId$successNote" -Tag "Success"
+                Write-Log "$AppId (machine)$successNote" -Tag "Success"
                 return $true
             }
 
@@ -694,15 +746,43 @@ function Update-Application {
                 return $null
             }
 
-            $tryUserScope = ($exitInfo.Category -eq 'RetryScope') -or ($exitCode -eq -1978335189) -or $outputClaimsNoApplicable
-            if ($tryUserScope) {
-                Write-Log "Retry: --scope user" -Tag "Info"
-                $second = Invoke-UpgradeWithInProgressWait -WithScopeUser $true -Locale $localeArg
+            $tryDefaultScope = (Test-ShouldAdvanceScopeLadder -ExitInfo $exitInfo -ExitCode $exitCode -OutputClaimsNoApplicable $outputClaimsNoApplicable) -or ($exitCode -eq -1978335212)
+            if ($tryDefaultScope) {
+                Write-Log "Retry: no --scope" -Tag "Info"
+                $second = Invoke-UpgradeWithInProgressWait -ScopeMode Default -Locale $localeArg
                 $upgradeOutput = $second.Output
                 $exitCode = $second.ExitCode
 
                 if ($exitCode -eq -1978334974) {
-                    Write-Log "Install still busy: $AppId" -Tag "Info"
+                    Write-Log "Defer ${AppId}: install busy (max waits)" -Tag "Info"
+                    return $null
+                }
+
+                $exitInfo = Get-WingetExitCodeInfo -ExitCode $exitCode
+                $outputClaimsNoApplicable = Test-WingetUpgradeOutputClaimsNoApplicable -Lines $upgradeOutput
+
+                $treatAsSuccess = ($exitInfo.Category -eq 'Success') -and -not $outputClaimsNoApplicable
+
+                if ($treatAsSuccess) {
+                    Write-Log "$AppId (default scope)$successNote" -Tag "Success"
+                    return $true
+                }
+
+                if ($exitInfo.Category -eq 'RetryLater') {
+                    Write-Log "Defer ${AppId}: $($exitInfo.Description)" -Tag "Info"
+                    return $null
+                }
+            }
+
+            $tryUserScope = Test-ShouldAdvanceScopeLadder -ExitInfo $exitInfo -ExitCode $exitCode -OutputClaimsNoApplicable $outputClaimsNoApplicable
+            if ($tryUserScope) {
+                Write-Log "Retry: --scope user" -Tag "Info"
+                $third = Invoke-UpgradeWithInProgressWait -ScopeMode User -Locale $localeArg
+                $upgradeOutput = $third.Output
+                $exitCode = $third.ExitCode
+
+                if ($exitCode -eq -1978334974) {
+                    Write-Log "Defer ${AppId}: install busy (max waits)" -Tag "Info"
                     return $null
                 }
 
@@ -758,7 +838,7 @@ try {
     Write-Log "Sources OK" -Tag "Debug"
 
     if (Test-PendingReboot) {
-        Write-Log "Reboot pending" -Tag "Info"
+        Write-Log "Reboot pending." -Tag "Info"
     }
 
     # Get available updates
