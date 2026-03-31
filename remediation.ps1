@@ -12,6 +12,7 @@ $blacklistApps = @(
     'Microsoft.RemoteDesktopClient',
     'Microsoft.GlobalSecureAccessClient',
     'Microsoft.VCLibs.*',
+    'Microsoft.AdministrativeTemplates',
     '3CX.Softphone',
     'TrackerSoftware.PDF-XChange*',
     'Fortinet.FortiClientVPN',
@@ -44,8 +45,11 @@ $wingetLocaleWorkaround = 'en-US'
 
 # When WinGet returns INSTALL_IN_PROGRESS (0x8A150102 / -1978334974), wait and re-run the same upgrade attempt.
 # Defaults match https://github.com/Barg0/Intune-WinGet/blob/main/templates/install.ps1 ($maxInProgressRetries / $inProgressDelaySeconds).
-$wingetInProgressMaxRetries  = 15
-$wingetInProgressWaitSeconds = 120
+$wingetInProgressMaxRetries      = 15
+$wingetInProgressWaitSeconds     = 120
+
+# When WinGet returns a transient download error (0x8A150008, 0x8A15002E, 0x8A150086), wait this long then retry once.
+$wingetDownloadRetryWaitSeconds  = 30
 
 # ---------------------------[ Script Start Timestamp ]---------------------------
 $scriptStartTime = Get-Date
@@ -67,14 +71,17 @@ $logFile          = "$logFileDirectory\$logFileName"
 # ---------------------------[ Winget Exit Code Map ]---------------------------
 # Only codes that can realistically fire during winget upgrade / install.
 # Sources:
-#   https://kb.filewave.com/books/microsoft-windows-package-manager-winget/page/troubleshooting-errors-with-winget
 #   https://github.com/microsoft/winget-cli/blob/master/doc/windows/package-manager/winget/returnCodes.md
+#   https://kb.filewave.com/books/microsoft-windows-package-manager-winget/page/troubleshooting-errors-with-winget
 #
 # Categories drive the retry engine:
-#   Success    - Desired state reached. No action needed.
-#   RetryScope - No applicable installer / no packages for scope; advance upgrade ladder (machine → default → user).
-#   RetryLater - Transient (app in use, disk full, reboot, network). Defer to next Intune cycle.
-#   Fail       - Unrecoverable in automation (policy block, hash mismatch, unsupported).
+#   Success            – Desired state reached. No action needed.
+#   RetryScope         – No applicable installer / no packages for scope; advance upgrade ladder (machine → default → user).
+#   RetrySourceRepair  – Source index is corrupt/missing. Run `winget source reset --force` + `source update`, then retry ladder.
+#   RetryHashRefresh   – Installer hash mismatch. Run `winget source update` (pull fresh manifests), then retry same scope.
+#   RetryDownload      – Transient CDN / download failure. Wait, then retry same scope once.
+#   RetryLater         – Transient (app in use, disk full, reboot, network). Defer to next Intune cycle.
+#   Fail               – Unrecoverable in automation (policy block, unsupported, structural).
 #
 # WinGet often returns signed 32-bit HRESULTs (negative). Do not cast those directly to
 # [uint32] for hex display — it throws. Reinterpret bits via BitConverter instead.
@@ -88,72 +95,102 @@ function Get-WingetExitCodeInfo {
     [CmdletBinding()]
     param([int]$ExitCode)
     $codeMap = @{
-        # ── Success ──
-        0              = @{ Category = 'Success';    Description = 'Success' }
-        3010           = @{ Category = 'Success';    Description = 'Success (reboot required to complete)' }              # MSI ERROR_SUCCESS_REBOOT_REQUIRED
-        -1978335135    = @{ Category = 'Success';    Description = 'Package already installed' }                           # 0x8A150061
-        -1978334963    = @{ Category = 'Success';    Description = 'Another version already installed' }                   # 0x8A15010D
-        -1978334962    = @{ Category = 'Success';    Description = 'Higher version already installed (downgrade)' }        # 0x8A15010E
-        -1978334965    = @{ Category = 'Success';    Description = 'Reboot initiated to finish installation' }             # 0x8A15010B
-        # 0x8A15002B: NOT Success for targeted `winget upgrade --id` — list can show "Available" while no installer applies (arch/scope/requirements).
-        -1978335189    = @{ Category = 'Fail';       Description = 'No applicable upgrade (does not apply to system or scope)' } # 0x8A15002B
+        # ── Success: desired state reached ──
+        0              = @{ Category = 'Success';            Description = 'Success' }
+        3010           = @{ Category = 'Success';            Description = 'Success (reboot required to complete)' }               # MSI ERROR_SUCCESS_REBOOT_REQUIRED
+        -1978335135    = @{ Category = 'Success';            Description = 'Package already installed' }                            # 0x8A150061
+        -1978334965    = @{ Category = 'Success';            Description = 'Reboot initiated to finish installation' }              # 0x8A15010B
+        -1978334963    = @{ Category = 'Success';            Description = 'Another version already installed' }                    # 0x8A15010D
+        -1978334962    = @{ Category = 'Success';            Description = 'Higher version already installed (downgrade)' }         # 0x8A15010E
 
-        # INSTALL_CANCELLED_BY_USER (0x8A15010C) — mapped in Intune-WinGet install.ps1; silent upgrades may still surface it from the installer
-        -1978334964    = @{ Category = 'Fail';       Description = 'Installation cancelled by user' }                       # 0x8A15010C
+        # ── RetryScope: advance upgrade ladder (machine → default → user) ──
+        # Aligned with Barg0/Intune-WinGet install.ps1.
+        -1978335216    = @{ Category = 'RetryScope';         Description = 'No applicable installer for current scope' }            # 0x8A150010
+        -1978335212    = @{ Category = 'RetryScope';         Description = 'No packages found' }                                    # 0x8A150014
+        # ShellExecute failed to *launch* the installer — often a scope/elevation mismatch in SYSTEM context.
+        -1978335226    = @{ Category = 'RetryScope';         Description = 'ShellExecute install failed (try other scopes)' }       # 0x8A150006
 
-        # ── RetryScope: advance upgrade ladder (machine → default → user); aligned with Barg0/Intune-WinGet install.ps1
-        -1978335216    = @{ Category = 'RetryScope'; Description = 'No applicable installer for current scope' }           # 0x8A150010
-        -1978335212    = @{ Category = 'RetryScope'; Description = 'No packages found' }                                   # 0x8A150014 NO_APPLICATIONS_FOUND
+        # ── RetrySourceRepair: source corrupt/missing → winget source reset --force + source update, then retry ladder ──
+        -1978335222    = @{ Category = 'RetrySourceRepair';  Description = 'Index is corrupt' }                                     # 0x8A15000A
+        -1978335221    = @{ Category = 'RetrySourceRepair';  Description = 'Configured source information is corrupt' }             # 0x8A15000B
+        -1978335217    = @{ Category = 'RetrySourceRepair';  Description = 'Source data missing' }                                  # 0x8A15000F
+        -1978335169    = @{ Category = 'RetrySourceRepair';  Description = 'Source data corrupted or tampered' }                    # 0x8A15003F
+        -1978335163    = @{ Category = 'RetrySourceRepair';  Description = 'Failed to open source' }                                # 0x8A150045
+        -1978335157    = @{ Category = 'RetrySourceRepair';  Description = 'Failed to open one or more sources' }                   # 0x8A15004B
+
+        # ── RetryHashRefresh: installer hash mismatch → winget source update (pull fresh manifests), then retry ──
+        # --force does NOT override hash checks when running as admin/SYSTEM (winget-cli #1812).
+        # A source update often fixes it because the publisher updated the binary before the manifest was refreshed.
+        -1978335215    = @{ Category = 'RetryHashRefresh';   Description = 'Installer hash does not match manifest' }               # 0x8A150011
+
+        # ── RetryDownload: transient CDN / download error → wait, then retry once ──
+        -1978335224    = @{ Category = 'RetryDownload';      Description = 'Download failed' }                                      # 0x8A150008
+        -1978335186    = @{ Category = 'RetryDownload';      Description = 'Download size mismatch' }                               # 0x8A15002E
+        -1978335098    = @{ Category = 'RetryDownload';      Description = 'Downloaded zero-byte installer' }                       # 0x8A150086
 
         # ── RetryLater: transient – defer to next Intune cycle ──
-        -1978334975    = @{ Category = 'RetryLater'; Description = 'Application is currently running' }                    # 0x8A150101
-        -1978334974    = @{ Category = 'RetryLater'; Description = 'Another installation in progress' }                    # 0x8A150102
-        -1978334973    = @{ Category = 'RetryLater'; Description = 'One or more file is in use' }                          # 0x8A150103
-        -1978334971    = @{ Category = 'RetryLater'; Description = 'Disk full' }                                           # 0x8A150105
-        -1978334970    = @{ Category = 'RetryLater'; Description = 'Insufficient memory' }                                 # 0x8A150106
-        -1978334969    = @{ Category = 'RetryLater'; Description = 'No network connectivity' }                             # 0x8A150107
-        -1978334967    = @{ Category = 'RetryLater'; Description = 'Reboot required to finish installation' }              # 0x8A150109
-        -1978334966    = @{ Category = 'RetryLater'; Description = 'Reboot required then try again' }                      # 0x8A15010A
-        -1978334959    = @{ Category = 'RetryLater'; Description = 'Application in use by another application' }           # 0x8A150111
-        -1978335123    = @{ Category = 'RetryLater'; Description = 'Service busy or unavailable' }                         # 0x8A15006D
-        -1978335224    = @{ Category = 'RetryLater'; Description = 'Download failed' }                                     # 0x8A150008
-        -1978335186    = @{ Category = 'RetryLater'; Description = 'Download size mismatch' }                              # 0x8A15002E
-        -1978335126    = @{ Category = 'RetryLater'; Description = 'Application shutdown signal received' }                # 0x8A15006A
-        -1978335125    = @{ Category = 'RetryLater'; Description = 'Failed to download dependencies' }                     # 0x8A15006B
+        -1978335227    = @{ Category = 'RetryLater';         Description = 'Cancellation signal received' }                         # 0x8A150005
+        -1978335126    = @{ Category = 'RetryLater';         Description = 'Application shutdown signal received' }                 # 0x8A15006A
+        -1978335125    = @{ Category = 'RetryLater';         Description = 'Failed to download dependencies' }                      # 0x8A15006B
+        -1978335123    = @{ Category = 'RetryLater';         Description = 'Service busy or unavailable' }                          # 0x8A15006D
+        -1978334975    = @{ Category = 'RetryLater';         Description = 'Application is currently running' }                     # 0x8A150101
+        -1978334974    = @{ Category = 'RetryLater';         Description = 'Another installation in progress' }                     # 0x8A150102
+        -1978334973    = @{ Category = 'RetryLater';         Description = 'One or more file is in use' }                           # 0x8A150103
+        -1978334971    = @{ Category = 'RetryLater';         Description = 'Disk full' }                                            # 0x8A150105
+        -1978334970    = @{ Category = 'RetryLater';         Description = 'Insufficient memory' }                                  # 0x8A150106
+        -1978334969    = @{ Category = 'RetryLater';         Description = 'No network connectivity' }                              # 0x8A150107
+        -1978334967    = @{ Category = 'RetryLater';         Description = 'Reboot required to finish installation' }               # 0x8A150109
+        -1978334966    = @{ Category = 'RetryLater';         Description = 'Reboot required then try again' }                       # 0x8A15010A
+        -1978334959    = @{ Category = 'RetryLater';         Description = 'Application in use by another application' }            # 0x8A150111
 
         # ── Fail: unrecoverable without human intervention ──
-        -1978335231    = @{ Category = 'Fail'; Description = 'Internal error' }                                            # 0x8A150001
-        -1978335230    = @{ Category = 'Fail'; Description = 'Invalid command line arguments' }                            # 0x8A150002
-        -1978335229    = @{ Category = 'Fail'; Description = 'Command failed' }                                            # 0x8A150003
-        -1978335228    = @{ Category = 'Fail'; Description = 'Opening manifest failed' }                                   # 0x8A150004
-        -1978335226    = @{ Category = 'Fail'; Description = 'ShellExecute install failed' }                               # 0x8A150006
-        -1978335225    = @{ Category = 'Fail'; Description = 'Manifest version higher than supported; update winget' }     # 0x8A150007
-        -1978335221    = @{ Category = 'Fail'; Description = 'Configured source information is corrupt' }                  # 0x8A15000B
-        -1978335217    = @{ Category = 'Fail'; Description = 'Source data missing' }                                       # 0x8A15000F
-        -1978335215    = @{ Category = 'Fail'; Description = 'Installer hash does not match manifest' }                    # 0x8A150011
-        -1978335210    = @{ Category = 'Fail'; Description = 'Multiple packages found matching criteria' }                 # 0x8A150016
-        -1978335209    = @{ Category = 'Fail'; Description = 'No manifest found matching criteria' }                       # 0x8A150017
-        -1978335207    = @{ Category = 'Fail'; Description = 'Command requires administrator privileges' }                 # 0x8A150019
-        -1978335205    = @{ Category = 'Fail'; Description = 'Microsoft Store client blocked by policy' }                  # 0x8A15001B
-        -1978335204    = @{ Category = 'Fail'; Description = 'Microsoft Store app blocked by policy' }                     # 0x8A15001C
-        -1978335187    = @{ Category = 'Fail'; Description = 'Installer failed security check' }                           # 0x8A15002D
-        -1978335174    = @{ Category = 'Fail'; Description = 'Blocked by Group Policy' }                                   # 0x8A15003A
-        -1978335169    = @{ Category = 'Fail'; Description = 'Source data corrupted or tampered' }                         # 0x8A15003F
-        -1978335163    = @{ Category = 'Fail'; Description = 'Failed to open source' }                                     # 0x8A150045
-        -1978335157    = @{ Category = 'Fail'; Description = 'Failed to open one or more sources' }                        # 0x8A15004B
-        -1978335159    = @{ Category = 'Fail'; Description = 'MSI install failed' }                                        # 0x8A150049
-        -1978335153    = @{ Category = 'Fail'; Description = 'Upgrade version not newer than installed' }                   # 0x8A15004F
-        -1978335146    = @{ Category = 'Fail'; Description = 'Installer prohibits elevation' }                              # 0x8A150056
-        -1978335138    = @{ Category = 'Fail'; Description = 'Pinned certificate mismatch' }                               # 0x8A15005E
-        -1978335128    = @{ Category = 'Fail'; Description = 'Package has a pin that prevents upgrade' }                    # 0x8A150068
-        -1978335122    = @{ Category = 'Fail'; Description = 'Package is a stub; full package needed' }                     # 0x8A150069
-        -1978334972    = @{ Category = 'Fail'; Description = 'Missing dependency on system' }                               # 0x8A150104
-        -1978334968    = @{ Category = 'Fail'; Description = 'Installation error; contact support' }                        # 0x8A150108
-        -1978334961    = @{ Category = 'Fail'; Description = 'Blocked by organization policy' }                             # 0x8A15010F
-        -1978334960    = @{ Category = 'Fail'; Description = 'Failed to install package dependencies' }                     # 0x8A150110
-        -1978334958    = @{ Category = 'Fail'; Description = 'Invalid parameter' }                                          # 0x8A150112
-        -1978334957    = @{ Category = 'Fail'; Description = 'Package not supported by system' }                            # 0x8A150113
-        -1978334956    = @{ Category = 'Fail'; Description = 'Installer does not support upgrading existing package' }      # 0x8A150114
+        -1978335231    = @{ Category = 'Fail';               Description = 'Internal error' }                                       # 0x8A150001
+        -1978335230    = @{ Category = 'Fail';               Description = 'Invalid command line arguments' }                       # 0x8A150002
+        -1978335229    = @{ Category = 'Fail';               Description = 'Command failed' }                                       # 0x8A150003
+        -1978335228    = @{ Category = 'Fail';               Description = 'Opening manifest failed' }                              # 0x8A150004
+        -1978335225    = @{ Category = 'Fail';               Description = 'Manifest version higher than supported; update winget' } # 0x8A150007
+        -1978335210    = @{ Category = 'Fail';               Description = 'Multiple packages found matching criteria' }            # 0x8A150016
+        -1978335209    = @{ Category = 'Fail';               Description = 'No manifest found matching criteria' }                  # 0x8A150017
+        -1978335207    = @{ Category = 'Fail';               Description = 'Command requires administrator privileges' }            # 0x8A150019
+        -1978335205    = @{ Category = 'Fail';               Description = 'Microsoft Store client blocked by policy' }             # 0x8A15001B
+        -1978335204    = @{ Category = 'Fail';               Description = 'Microsoft Store app blocked by policy' }                # 0x8A15001C
+        # 0x8A15002B: NOT Success for targeted `winget upgrade --id` — list can show "Available" while
+        # no installer applies. The scope ladder handler checks this exit code explicitly so it still advances.
+        -1978335189    = @{ Category = 'Fail';               Description = 'No applicable upgrade (does not apply to system or scope)' } # 0x8A15002B
+        -1978335188    = @{ Category = 'Fail';               Description = 'upgrade --all completed with failures' }                # 0x8A15002C
+        -1978335187    = @{ Category = 'Fail';               Description = 'Installer failed security check' }                      # 0x8A15002D
+        -1978335174    = @{ Category = 'Fail';               Description = 'Blocked by Group Policy' }                              # 0x8A15003A
+        -1978335159    = @{ Category = 'Fail';               Description = 'MSI install failed' }                                   # 0x8A150049
+        -1978335153    = @{ Category = 'Fail';               Description = 'Upgrade version not newer than installed' }              # 0x8A15004F
+        -1978335152    = @{ Category = 'Fail';               Description = 'Upgrade version unknown; override not specified' }       # 0x8A150050
+        -1978335146    = @{ Category = 'Fail';               Description = 'Installer prohibits elevation' }                         # 0x8A150056
+        -1978335138    = @{ Category = 'Fail';               Description = 'Pinned certificate mismatch' }                           # 0x8A15005E
+        -1978335128    = @{ Category = 'Fail';               Description = 'Package has a pin that prevents upgrade' }               # 0x8A150068
+        -1978335127    = @{ Category = 'Fail';               Description = 'Package is a stub; full package needed' }                # 0x8A150069
+        -1978335090    = @{ Category = 'Fail';               Description = 'Install technology mismatch (different installer type)' } # 0x8A15008E
+        -1978334972    = @{ Category = 'Fail';               Description = 'Missing dependency on system' }                          # 0x8A150104
+        -1978334968    = @{ Category = 'Fail';               Description = 'Installation error; contact support' }                   # 0x8A150108
+        -1978334964    = @{ Category = 'Fail';               Description = 'Installation cancelled by user' }                        # 0x8A15010C
+        -1978334961    = @{ Category = 'Fail';               Description = 'Blocked by organization policy' }                        # 0x8A15010F
+        -1978334960    = @{ Category = 'Fail';               Description = 'Failed to install package dependencies' }                # 0x8A150110
+        -1978334958    = @{ Category = 'Fail';               Description = 'Invalid parameter' }                                     # 0x8A150112
+        -1978334957    = @{ Category = 'Fail';               Description = 'Package not supported by system' }                       # 0x8A150113
+        -1978334956    = @{ Category = 'Fail';               Description = 'Installer does not support upgrading existing package' }  # 0x8A150114
+        -1978334955    = @{ Category = 'Fail';               Description = 'Installer custom error' }                                # 0x8A150115
+
+        # ── Win32 / WinINet codes – frequently seen as "Unmapped exit code" in Intune runs ──
+        # These originate from the installer process (EXE/MSI) or from WinGet's own HTTP stack, not from
+        # the AppInstaller HRESULT space (0x8A15xxxx), so WinGet logs them verbatim as "Unmapped".
+        # Reference: winerror.h / wininet.h; confirmed against winget-cli issues #1546, #5232, #4283.
+        -2147023673    = @{ Category = 'RetryLater';         Description = 'Operation cancelled - ERROR_CANCELLED (0x800704C7)' }
+        -2147012894    = @{ Category = 'RetryLater';         Description = 'Connection timed out - ERROR_INTERNET_TIMEOUT (0x80072EE2)' }
+        -2147012889    = @{ Category = 'RetryLater';         Description = 'DNS name not resolved - ERROR_INTERNET_NAME_NOT_RESOLVED (0x80072EE7)' }
+        -2147012867    = @{ Category = 'RetryLater';         Description = 'Cannot connect to server - ERROR_INTERNET_CANNOT_CONNECT (0x80072EFD)' }
+        -2147012866    = @{ Category = 'RetryLater';         Description = 'Connection aborted - ERROR_INTERNET_CONNECTION_ABORTED (0x80072EFE)' }
+        -2147012465    = @{ Category = 'RetryLater';         Description = 'TLS/SSL error - ERROR_INTERNET_DECRYPTION_FAILED (0x80072F8F)' }
+        -2147024891    = @{ Category = 'Fail';               Description = 'Access denied - ERROR_ACCESS_DENIED (0x80070005)' }
+        -2147023293    = @{ Category = 'Fail';               Description = 'MSI fatal error - ERROR_INSTALL_FAILURE (0x80070643 / 1603)' }
+        -2147023286    = @{ Category = 'RetryLater';         Description = 'Windows Installer busy - ERROR_INSTALL_ALREADY_RUNNING (0x8007064A / 1610)' }
     }
     if ($codeMap.ContainsKey($ExitCode)) { return $codeMap[$ExitCode] }
     $hex = Format-WingetExitCodeHex -Code $ExitCode
@@ -667,9 +704,13 @@ function Update-Application {
             [ValidateSet('Machine', 'Default', 'User')]
             [string]$ScopeMode,
 
-            [string]$Locale
+            [string]$Locale,
+
+            [bool]$ExactMatch = $true
         )
-        $wingetArgs = @('upgrade', '--id', $AppId, '-e', '--accept-package-agreements', '--accept-source-agreements', '-h', '--source', 'winget')
+        $wingetArgs = @('upgrade', '--id', $AppId)
+        if ($ExactMatch) { $wingetArgs += '-e' }
+        $wingetArgs += '--accept-package-agreements', '--accept-source-agreements', '-h', '--source', 'winget'
         if (-not [string]::IsNullOrWhiteSpace($Locale)) { $wingetArgs += '--locale', $Locale.Trim() }
         if ($ScopeMode -eq 'Machine') { $wingetArgs += '--scope', 'machine' }
         elseif ($ScopeMode -eq 'User') { $wingetArgs += '--scope', 'user' }
@@ -682,7 +723,9 @@ function Update-Application {
             [ValidateSet('Machine', 'Default', 'User')]
             [string]$ScopeMode,
 
-            [string]$Locale
+            [string]$Locale,
+
+            [bool]$ExactMatch = $true
         )
         $inProgressCount = 0
         $upgradeOutput = @()
@@ -692,13 +735,39 @@ function Update-Application {
                 Write-Log "Install busy; wait ${wingetInProgressWaitSeconds}s ($inProgressCount/$wingetInProgressMaxRetries)" -Tag "Info"
                 Start-Sleep -Seconds $wingetInProgressWaitSeconds
             }
-            $upgradeOutput = Invoke-Upgrade -ScopeMode $ScopeMode -Locale $Locale
+            $upgradeOutput = Invoke-Upgrade -ScopeMode $ScopeMode -Locale $Locale -ExactMatch $ExactMatch
             $exitCode = $LASTEXITCODE
             if ($null -eq $upgradeOutput) { $upgradeOutput = @() }
             if ($exitCode -ne -1978334974) { break }
             $inProgressCount++
         } while ($inProgressCount -le $wingetInProgressMaxRetries)
         return @{ Output = $upgradeOutput; ExitCode = $exitCode }
+    }
+
+    function Invoke-UpgradeAttempt {
+        param(
+            [ValidateSet('Machine', 'Default', 'User')]
+            [string]$ScopeMode,
+
+            [string]$Locale,
+
+            [bool]$ExactMatch = $true
+        )
+        $result = Invoke-UpgradeWithInProgressWait -ScopeMode $ScopeMode -Locale $Locale -ExactMatch $ExactMatch
+        $exitInfo = Get-WingetExitCodeInfo -ExitCode $result.ExitCode
+
+        if ($exitInfo.Category -eq 'RetryHashRefresh') {
+            Write-Log "Hash mismatch ${AppId}: refreshing source index" -Tag "Info"
+            & $WingetPath source update --name winget 2>&1 | Out-Null
+            $result = Invoke-UpgradeWithInProgressWait -ScopeMode $ScopeMode -Locale $Locale -ExactMatch $ExactMatch
+        }
+        elseif ($exitInfo.Category -eq 'RetryDownload') {
+            Write-Log "Download failed ${AppId}: retry in ${wingetDownloadRetryWaitSeconds}s" -Tag "Info"
+            Start-Sleep -Seconds $wingetDownloadRetryWaitSeconds
+            $result = Invoke-UpgradeWithInProgressWait -ScopeMode $ScopeMode -Locale $Locale -ExactMatch $ExactMatch
+        }
+
+        return $result
     }
 
     function Test-ShouldAdvanceScopeLadder {
@@ -712,6 +781,8 @@ function Update-Application {
 
     try {
         $localePassMax = if ([string]::IsNullOrWhiteSpace($wingetLocaleWorkaround)) { 1 } else { 2 }
+        $sourceRepairDone = $false
+
         for ($localePass = 0; $localePass -lt $localePassMax; $localePass++) {
             $localeArg = ''
             if ($localePass -eq 1) {
@@ -719,39 +790,26 @@ function Update-Application {
                 Write-Log "Retry: --locale $localeArg" -Tag "Info"
             }
 
-            $successNote = if ($localePass -eq 0) { '' } else { ' (locale workaround)' }
+            $deferCategories = @('RetryLater', 'RetryHashRefresh', 'RetryDownload')
 
-            # 1) --scope machine (system-context upgrades; matches Intune-WinGet install.ps1 defaultScope machine)
-            $first = Invoke-UpgradeWithInProgressWait -ScopeMode Machine -Locale $localeArg
-            $upgradeOutput = $first.Output
-            $exitCode = $first.ExitCode
+            # Scope ladder — runs twice at most: once normally, once after source repair
+            for ($ladderRun = 0; $ladderRun -lt 2; $ladderRun++) {
+                if ($ladderRun -eq 1) {
+                    Write-Log "Source repair: winget source reset + update" -Tag "Info"
+                    & $WingetPath source reset --force 2>&1 | Out-Null
+                    & $WingetPath source update 2>&1 | Out-Null
+                    Write-Log "Source repaired; retrying upgrade" -Tag "Info"
+                }
 
-            if ($exitCode -eq -1978334974) {
-                Write-Log "Defer ${AppId}: install busy (max waits)" -Tag "Info"
-                return $null
-            }
+                $runNotes = @()
+                if ($localePass -eq 1) { $runNotes += 'locale' }
+                if ($ladderRun -eq 1)  { $runNotes += 'source repair' }
+                $successNote = if ($runNotes.Count -gt 0) { " ($($runNotes -join ', '))" } else { '' }
 
-            $exitInfo = Get-WingetExitCodeInfo -ExitCode $exitCode
-            $outputClaimsNoApplicable = Test-WingetUpgradeOutputClaimsNoApplicable -Lines $upgradeOutput
-
-            $treatAsSuccess = ($exitInfo.Category -eq 'Success') -and -not $outputClaimsNoApplicable
-
-            if ($treatAsSuccess) {
-                Write-Log "$AppId (machine)$successNote" -Tag "Success"
-                return $true
-            }
-
-            if ($exitInfo.Category -eq 'RetryLater') {
-                Write-Log "Defer ${AppId}: $($exitInfo.Description)" -Tag "Info"
-                return $null
-            }
-
-            $tryDefaultScope = (Test-ShouldAdvanceScopeLadder -ExitInfo $exitInfo -ExitCode $exitCode -OutputClaimsNoApplicable $outputClaimsNoApplicable) -or ($exitCode -eq -1978335212)
-            if ($tryDefaultScope) {
-                Write-Log "Retry: no --scope" -Tag "Info"
-                $second = Invoke-UpgradeWithInProgressWait -ScopeMode Default -Locale $localeArg
-                $upgradeOutput = $second.Output
-                $exitCode = $second.ExitCode
+                # 1) --scope machine (system-context upgrades; matches Intune-WinGet install.ps1 defaultScope machine)
+                $first = Invoke-UpgradeAttempt -ScopeMode Machine -Locale $localeArg
+                $upgradeOutput = $first.Output
+                $exitCode = $first.ExitCode
 
                 if ($exitCode -eq -1978334974) {
                     Write-Log "Defer ${AppId}: install busy (max waits)" -Tag "Info"
@@ -760,50 +818,115 @@ function Update-Application {
 
                 $exitInfo = Get-WingetExitCodeInfo -ExitCode $exitCode
                 $outputClaimsNoApplicable = Test-WingetUpgradeOutputClaimsNoApplicable -Lines $upgradeOutput
-
                 $treatAsSuccess = ($exitInfo.Category -eq 'Success') -and -not $outputClaimsNoApplicable
 
                 if ($treatAsSuccess) {
-                    Write-Log "$AppId (default scope)$successNote" -Tag "Success"
+                    Write-Log "$AppId (machine)$successNote" -Tag "Success"
                     return $true
                 }
 
-                if ($exitInfo.Category -eq 'RetryLater') {
-                    Write-Log "Defer ${AppId}: $($exitInfo.Description)" -Tag "Info"
-                    return $null
-                }
-            }
-
-            $tryUserScope = Test-ShouldAdvanceScopeLadder -ExitInfo $exitInfo -ExitCode $exitCode -OutputClaimsNoApplicable $outputClaimsNoApplicable
-            if ($tryUserScope) {
-                Write-Log "Retry: --scope user" -Tag "Info"
-                $third = Invoke-UpgradeWithInProgressWait -ScopeMode User -Locale $localeArg
-                $upgradeOutput = $third.Output
-                $exitCode = $third.ExitCode
-
-                if ($exitCode -eq -1978334974) {
-                    Write-Log "Defer ${AppId}: install busy (max waits)" -Tag "Info"
-                    return $null
-                }
-
-                $exitInfo = Get-WingetExitCodeInfo -ExitCode $exitCode
-                $outputClaimsNoApplicable = Test-WingetUpgradeOutputClaimsNoApplicable -Lines $upgradeOutput
-
-                if (($exitInfo.Category -eq 'Success') -and -not $outputClaimsNoApplicable) {
-                    Write-Log "$AppId (user)$successNote" -Tag "Success"
-                    return $true
-                }
-
-                if ($exitInfo.Category -eq 'RetryLater') {
+                if ($exitInfo.Category -in $deferCategories) {
                     Write-Log "Defer ${AppId}: $($exitInfo.Description)" -Tag "Info"
                     return $null
                 }
 
-                Write-Log "User scope: exit $exitCode $($exitInfo.Description)" -Tag "Debug"
+                # 2) no --scope (WinGet default)
+                $tryDefaultScope = (Test-ShouldAdvanceScopeLadder -ExitInfo $exitInfo -ExitCode $exitCode -OutputClaimsNoApplicable $outputClaimsNoApplicable) -or ($exitCode -eq -1978335212)
+                if ($tryDefaultScope) {
+                    Write-Log "Retry: no --scope" -Tag "Info"
+                    $second = Invoke-UpgradeAttempt -ScopeMode Default -Locale $localeArg
+                    $upgradeOutput = $second.Output
+                    $exitCode = $second.ExitCode
+
+                    if ($exitCode -eq -1978334974) {
+                        Write-Log "Defer ${AppId}: install busy (max waits)" -Tag "Info"
+                        return $null
+                    }
+
+                    $exitInfo = Get-WingetExitCodeInfo -ExitCode $exitCode
+                    $outputClaimsNoApplicable = Test-WingetUpgradeOutputClaimsNoApplicable -Lines $upgradeOutput
+                    $treatAsSuccess = ($exitInfo.Category -eq 'Success') -and -not $outputClaimsNoApplicable
+
+                    if ($treatAsSuccess) {
+                        Write-Log "$AppId (default scope)$successNote" -Tag "Success"
+                        return $true
+                    }
+
+                    if ($exitInfo.Category -in $deferCategories) {
+                        Write-Log "Defer ${AppId}: $($exitInfo.Description)" -Tag "Info"
+                        return $null
+                    }
+                }
+
+                # 3) --scope user
+                $tryUserScope = Test-ShouldAdvanceScopeLadder -ExitInfo $exitInfo -ExitCode $exitCode -OutputClaimsNoApplicable $outputClaimsNoApplicable
+                if ($tryUserScope) {
+                    Write-Log "Retry: --scope user" -Tag "Info"
+                    $third = Invoke-UpgradeAttempt -ScopeMode User -Locale $localeArg
+                    $upgradeOutput = $third.Output
+                    $exitCode = $third.ExitCode
+
+                    if ($exitCode -eq -1978334974) {
+                        Write-Log "Defer ${AppId}: install busy (max waits)" -Tag "Info"
+                        return $null
+                    }
+
+                    $exitInfo = Get-WingetExitCodeInfo -ExitCode $exitCode
+                    $outputClaimsNoApplicable = Test-WingetUpgradeOutputClaimsNoApplicable -Lines $upgradeOutput
+
+                    if (($exitInfo.Category -eq 'Success') -and -not $outputClaimsNoApplicable) {
+                        Write-Log "$AppId (user)$successNote" -Tag "Success"
+                        return $true
+                    }
+
+                    if ($exitInfo.Category -in $deferCategories) {
+                        Write-Log "Defer ${AppId}: $($exitInfo.Description)" -Tag "Info"
+                        return $null
+                    }
+
+                    Write-Log "User scope: exit $exitCode $($exitInfo.Description)" -Tag "Debug"
+                }
+
+                # Source repair: if source-related error and not yet repaired, re-run ladder after repair
+                if ($ladderRun -eq 0 -and -not $sourceRepairDone -and $exitInfo.Category -eq 'RetrySourceRepair') {
+                    $sourceRepairDone = $true
+                    continue
+                }
+                break
             }
 
             if ($localePass -eq 0 -and $exitCode -eq -1978335212 -and -not [string]::IsNullOrWhiteSpace($wingetLocaleWorkaround)) {
                 continue
+            }
+
+            # Relaxed match fallback: if all passes ended with NO_APPLICATIONS_FOUND (0x8A150014),
+            # retry the scope ladder without the -e (exact match) flag.
+            # WinGet's exact matching can be too strict when ARP entries don't align with manifests (winget-cli #5249).
+            if ($exitCode -eq -1978335212) {
+                Write-Log "Retry: relaxed match (drop -e flag)" -Tag "Info"
+                foreach ($rScope in @('Machine', 'Default', 'User')) {
+                    if ($rScope -ne 'Machine') { Write-Log "Retry: $($rScope.ToLower()) scope (relaxed)" -Tag "Info" }
+
+                    $relaxed = Invoke-UpgradeAttempt -ScopeMode $rScope -Locale '' -ExactMatch $false
+                    $upgradeOutput = $relaxed.Output
+                    $exitCode = $relaxed.ExitCode
+                    $exitInfo = Get-WingetExitCodeInfo -ExitCode $exitCode
+                    $outputClaimsNoApplicable = Test-WingetUpgradeOutputClaimsNoApplicable -Lines $relaxed.Output
+
+                    if (($exitInfo.Category -eq 'Success') -and -not $outputClaimsNoApplicable) {
+                        Write-Log "$AppId ($($rScope.ToLower()), relaxed match)" -Tag "Success"
+                        return $true
+                    }
+
+                    if ($exitInfo.Category -in $deferCategories) {
+                        Write-Log "Defer ${AppId}: $($exitInfo.Description)" -Tag "Info"
+                        return $null
+                    }
+
+                    if (-not (Test-ShouldAdvanceScopeLadder -ExitInfo $exitInfo -ExitCode $exitCode -OutputClaimsNoApplicable $outputClaimsNoApplicable) -and $exitCode -ne -1978335212) {
+                        break
+                    }
+                }
             }
 
             $errorMessages = $upgradeOutput | Where-Object {
