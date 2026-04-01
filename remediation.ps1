@@ -53,13 +53,13 @@ $wingetDownloadRetryWaitSeconds  = 30
 
 # When all upgrade attempts fail with 0x8A150014 ("No packages found"), fall back to `winget install --version --force`.
 # The install command resolves against source manifests instead of ARP entries, bypassing the matching bug. Set to $false to disable.
-$wingetAllowInstallFallback      = $true
+$wingetAllowInstallFallback      = $false
 
 # LAST RESORT: if every upgrade and install attempt fails, try `winget upgrade --uninstall-previous`.
 # This uninstalls the existing version before installing the new one. Effective when the old installer
 # conflicts with the upgrade (ShellExecute failures, installer-type mismatches), but destructive if it
 # succeeds at uninstall but fails at install — the app will be gone. Set to $false to disable.
-$wingetAllowUninstallPrevious    = $true
+$wingetAllowUninstallPrevious    = $false
 
 # ---------------------------[ Script Start Timestamp ]---------------------------
 $scriptStartTime = Get-Date
@@ -939,7 +939,7 @@ function Update-Application {
             # Last resort: --uninstall-previous removes the old version first, then installs the new one.
             # Risky: if uninstall succeeds but install fails, the app is gone. Gated by $wingetAllowUninstallPrevious.
             if ($wingetAllowUninstallPrevious -and -not [string]::IsNullOrWhiteSpace($AvailableVersion)) {
-                Write-Log "Retry: uninstall-previous (last resort)" -Tag "Info"
+                Write-Log "Retry: uninstall-previous" -Tag "Info"
                 foreach ($uScope in @('Machine', 'Default', 'User')) {
                     if ($uScope -ne 'Machine') { Write-Log "Retry: $($uScope.ToLower()) scope (uninstall-previous)" -Tag "Info" }
 
