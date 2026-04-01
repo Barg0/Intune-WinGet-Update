@@ -51,6 +51,16 @@ $wingetInProgressWaitSeconds     = 120
 # When WinGet returns a transient download error (0x8A150008, 0x8A15002E, 0x8A150086), wait this long then retry once.
 $wingetDownloadRetryWaitSeconds  = 30
 
+# When all upgrade attempts fail with 0x8A150014 ("No packages found"), fall back to `winget install --version --force`.
+# The install command resolves against source manifests instead of ARP entries, bypassing the matching bug. Set to $false to disable.
+$wingetAllowInstallFallback      = $true
+
+# LAST RESORT: if every upgrade and install attempt fails, try `winget upgrade --uninstall-previous`.
+# This uninstalls the existing version before installing the new one. Effective when the old installer
+# conflicts with the upgrade (ShellExecute failures, installer-type mismatches), but destructive if it
+# succeeds at uninstall but fails at install — the app will be gone. Set to $false to disable.
+$wingetAllowUninstallPrevious    = $true
+
 # ---------------------------[ Script Start Timestamp ]---------------------------
 $scriptStartTime = Get-Date
 
@@ -154,9 +164,7 @@ function Get-WingetExitCodeInfo {
         -1978335207    = @{ Category = 'Fail';               Description = 'Command requires administrator privileges' }            # 0x8A150019
         -1978335205    = @{ Category = 'Fail';               Description = 'Microsoft Store client blocked by policy' }             # 0x8A15001B
         -1978335204    = @{ Category = 'Fail';               Description = 'Microsoft Store app blocked by policy' }                # 0x8A15001C
-        # 0x8A15002B: NOT Success for targeted `winget upgrade --id` — list can show "Available" while
-        # no installer applies. The scope ladder handler checks this exit code explicitly so it still advances.
-        -1978335189    = @{ Category = 'Fail';               Description = 'No applicable upgrade (does not apply to system or scope)' } # 0x8A15002B
+        -1978335189    = @{ Category = 'RetryScope';          Description = 'No applicable upgrade (does not apply to system or scope)' } # 0x8A15002B
         -1978335188    = @{ Category = 'Fail';               Description = 'upgrade --all completed with failures' }                # 0x8A15002C
         -1978335187    = @{ Category = 'Fail';               Description = 'Installer failed security check' }                      # 0x8A15002D
         -1978335174    = @{ Category = 'Fail';               Description = 'Blocked by Group Policy' }                              # 0x8A15003A
@@ -188,6 +196,7 @@ function Get-WingetExitCodeInfo {
         -2147012867    = @{ Category = 'RetryLater';         Description = 'Cannot connect to server - ERROR_INTERNET_CANNOT_CONNECT (0x80072EFD)' }
         -2147012866    = @{ Category = 'RetryLater';         Description = 'Connection aborted - ERROR_INTERNET_CONNECTION_ABORTED (0x80072EFE)' }
         -2147012465    = @{ Category = 'RetryLater';         Description = 'TLS/SSL error - ERROR_INTERNET_DECRYPTION_FAILED (0x80072F8F)' }
+        -2147221003    = @{ Category = 'Fail';               Description = 'Application/uninstaller not found - orphaned ARP entry (0x800401F5)' }
         -2147024891    = @{ Category = 'Fail';               Description = 'Access denied - ERROR_ACCESS_DENIED (0x80070005)' }
         -2147023293    = @{ Category = 'Fail';               Description = 'MSI fatal error - ERROR_INSTALL_FAILURE (0x80070643 / 1603)' }
         -2147023286    = @{ Category = 'RetryLater';         Description = 'Windows Installer busy - ERROR_INSTALL_ALREADY_RUNNING (0x8007064A / 1610)' }
@@ -696,7 +705,9 @@ function Update-Application {
         [string]$AppId,
 
         [Parameter(Mandatory = $true)]
-        [string]$WingetPath
+        [string]$WingetPath,
+
+        [string]$AvailableVersion = ''
     )
 
     function Invoke-Upgrade {
@@ -704,13 +715,9 @@ function Update-Application {
             [ValidateSet('Machine', 'Default', 'User')]
             [string]$ScopeMode,
 
-            [string]$Locale,
-
-            [bool]$ExactMatch = $true
+            [string]$Locale
         )
-        $wingetArgs = @('upgrade', '--id', $AppId)
-        if ($ExactMatch) { $wingetArgs += '-e' }
-        $wingetArgs += '--accept-package-agreements', '--accept-source-agreements', '-h', '--source', 'winget'
+        $wingetArgs = @('upgrade', '--id', $AppId, '-e', '--force', '--accept-package-agreements', '--accept-source-agreements', '-h', '--source', 'winget')
         if (-not [string]::IsNullOrWhiteSpace($Locale)) { $wingetArgs += '--locale', $Locale.Trim() }
         if ($ScopeMode -eq 'Machine') { $wingetArgs += '--scope', 'machine' }
         elseif ($ScopeMode -eq 'User') { $wingetArgs += '--scope', 'user' }
@@ -723,9 +730,7 @@ function Update-Application {
             [ValidateSet('Machine', 'Default', 'User')]
             [string]$ScopeMode,
 
-            [string]$Locale,
-
-            [bool]$ExactMatch = $true
+            [string]$Locale
         )
         $inProgressCount = 0
         $upgradeOutput = @()
@@ -735,7 +740,7 @@ function Update-Application {
                 Write-Log "Install busy; wait ${wingetInProgressWaitSeconds}s ($inProgressCount/$wingetInProgressMaxRetries)" -Tag "Info"
                 Start-Sleep -Seconds $wingetInProgressWaitSeconds
             }
-            $upgradeOutput = Invoke-Upgrade -ScopeMode $ScopeMode -Locale $Locale -ExactMatch $ExactMatch
+            $upgradeOutput = Invoke-Upgrade -ScopeMode $ScopeMode -Locale $Locale
             $exitCode = $LASTEXITCODE
             if ($null -eq $upgradeOutput) { $upgradeOutput = @() }
             if ($exitCode -ne -1978334974) { break }
@@ -749,22 +754,20 @@ function Update-Application {
             [ValidateSet('Machine', 'Default', 'User')]
             [string]$ScopeMode,
 
-            [string]$Locale,
-
-            [bool]$ExactMatch = $true
+            [string]$Locale
         )
-        $result = Invoke-UpgradeWithInProgressWait -ScopeMode $ScopeMode -Locale $Locale -ExactMatch $ExactMatch
+        $result = Invoke-UpgradeWithInProgressWait -ScopeMode $ScopeMode -Locale $Locale
         $exitInfo = Get-WingetExitCodeInfo -ExitCode $result.ExitCode
 
         if ($exitInfo.Category -eq 'RetryHashRefresh') {
             Write-Log "Hash mismatch ${AppId}: refreshing source index" -Tag "Info"
             & $WingetPath source update --name winget 2>&1 | Out-Null
-            $result = Invoke-UpgradeWithInProgressWait -ScopeMode $ScopeMode -Locale $Locale -ExactMatch $ExactMatch
+            $result = Invoke-UpgradeWithInProgressWait -ScopeMode $ScopeMode -Locale $Locale
         }
         elseif ($exitInfo.Category -eq 'RetryDownload') {
             Write-Log "Download failed ${AppId}: retry in ${wingetDownloadRetryWaitSeconds}s" -Tag "Info"
             Start-Sleep -Seconds $wingetDownloadRetryWaitSeconds
-            $result = Invoke-UpgradeWithInProgressWait -ScopeMode $ScopeMode -Locale $Locale -ExactMatch $ExactMatch
+            $result = Invoke-UpgradeWithInProgressWait -ScopeMode $ScopeMode -Locale $Locale
         }
 
         return $result
@@ -776,7 +779,7 @@ function Update-Application {
             [int]$ExitCode,
             [bool]$OutputClaimsNoApplicable
         )
-        return ($ExitInfo.Category -eq 'RetryScope') -or ($ExitCode -eq -1978335189) -or $OutputClaimsNoApplicable
+        return ($ExitInfo.Category -eq 'RetryScope') -or $OutputClaimsNoApplicable
     }
 
     try {
@@ -899,22 +902,26 @@ function Update-Application {
                 continue
             }
 
-            # Relaxed match fallback: if all passes ended with NO_APPLICATIONS_FOUND (0x8A150014),
-            # retry the scope ladder without the -e (exact match) flag.
-            # WinGet's exact matching can be too strict when ARP entries don't align with manifests (winget-cli #5249).
-            if ($exitCode -eq -1978335212) {
-                Write-Log "Retry: relaxed match (drop -e flag)" -Tag "Info"
-                foreach ($rScope in @('Machine', 'Default', 'User')) {
-                    if ($rScope -ne 'Machine') { Write-Log "Retry: $($rScope.ToLower()) scope (relaxed)" -Tag "Info" }
+            # Install fallback: if all upgrade paths failed with 0x8A150014, try winget install --version.
+            # The install command resolves packages against the source manifest rather than ARP entries,
+            # bypassing the matching bug that causes upgrade to return "No packages found" (winget-cli #5249, #6095).
+            if ($wingetAllowInstallFallback -and $exitCode -eq -1978335212 -and -not [string]::IsNullOrWhiteSpace($AvailableVersion)) {
+                Write-Log "Retry: install fallback (winget install --version $AvailableVersion)" -Tag "Info"
+                foreach ($iScope in @('Machine', 'Default', 'User')) {
+                    if ($iScope -ne 'Machine') { Write-Log "Retry: $($iScope.ToLower()) scope (install)" -Tag "Info" }
 
-                    $relaxed = Invoke-UpgradeAttempt -ScopeMode $rScope -Locale '' -ExactMatch $false
-                    $upgradeOutput = $relaxed.Output
-                    $exitCode = $relaxed.ExitCode
+                    $installArgs = @('install', '--id', $AppId, '-e', '--version', $AvailableVersion, '--force',
+                        '--accept-package-agreements', '--accept-source-agreements', '-h', '--source', 'winget')
+                    if ($iScope -eq 'Machine') { $installArgs += '--scope', 'machine' }
+                    elseif ($iScope -eq 'User') { $installArgs += '--scope', 'user' }
+                    Write-Log "winget $($installArgs -join ' ')" -Tag "Debug"
+                    $upgradeOutput = & $WingetPath @installArgs 2>&1 | Where-Object { $_ -notlike " *" }
+                    $exitCode = $LASTEXITCODE
                     $exitInfo = Get-WingetExitCodeInfo -ExitCode $exitCode
-                    $outputClaimsNoApplicable = Test-WingetUpgradeOutputClaimsNoApplicable -Lines $relaxed.Output
+                    $outputClaimsNoApplicable = Test-WingetUpgradeOutputClaimsNoApplicable -Lines $upgradeOutput
 
                     if (($exitInfo.Category -eq 'Success') -and -not $outputClaimsNoApplicable) {
-                        Write-Log "$AppId ($($rScope.ToLower()), relaxed match)" -Tag "Success"
+                        Write-Log "$AppId ($($iScope.ToLower()), install fallback)" -Tag "Success"
                         return $true
                     }
 
@@ -924,6 +931,39 @@ function Update-Application {
                     }
 
                     if (-not (Test-ShouldAdvanceScopeLadder -ExitInfo $exitInfo -ExitCode $exitCode -OutputClaimsNoApplicable $outputClaimsNoApplicable) -and $exitCode -ne -1978335212) {
+                        break
+                    }
+                }
+            }
+
+            # Last resort: --uninstall-previous removes the old version first, then installs the new one.
+            # Risky: if uninstall succeeds but install fails, the app is gone. Gated by $wingetAllowUninstallPrevious.
+            if ($wingetAllowUninstallPrevious -and -not [string]::IsNullOrWhiteSpace($AvailableVersion)) {
+                Write-Log "Retry: uninstall-previous (last resort)" -Tag "Info"
+                foreach ($uScope in @('Machine', 'Default', 'User')) {
+                    if ($uScope -ne 'Machine') { Write-Log "Retry: $($uScope.ToLower()) scope (uninstall-previous)" -Tag "Info" }
+
+                    $uninstPrevArgs = @('upgrade', '--id', $AppId, '-e', '--version', $AvailableVersion, '--force',
+                        '--uninstall-previous', '--accept-package-agreements', '--accept-source-agreements', '-h', '--source', 'winget')
+                    if ($uScope -eq 'Machine') { $uninstPrevArgs += '--scope', 'machine' }
+                    elseif ($uScope -eq 'User') { $uninstPrevArgs += '--scope', 'user' }
+                    Write-Log "winget $($uninstPrevArgs -join ' ')" -Tag "Debug"
+                    $upgradeOutput = & $WingetPath @uninstPrevArgs 2>&1 | Where-Object { $_ -notlike " *" }
+                    $exitCode = $LASTEXITCODE
+                    $exitInfo = Get-WingetExitCodeInfo -ExitCode $exitCode
+                    $outputClaimsNoApplicable = Test-WingetUpgradeOutputClaimsNoApplicable -Lines $upgradeOutput
+
+                    if (($exitInfo.Category -eq 'Success') -and -not $outputClaimsNoApplicable) {
+                        Write-Log "$AppId ($($uScope.ToLower()), uninstall-previous)" -Tag "Success"
+                        return $true
+                    }
+
+                    if ($exitInfo.Category -in $deferCategories) {
+                        Write-Log "Defer ${AppId}: $($exitInfo.Description)" -Tag "Info"
+                        return $null
+                    }
+
+                    if (-not (Test-ShouldAdvanceScopeLadder -ExitInfo $exitInfo -ExitCode $exitCode -OutputClaimsNoApplicable $outputClaimsNoApplicable)) {
                         break
                     }
                 }
@@ -1008,7 +1048,7 @@ try {
 
         Write-Log "[$updateIndex/$($filteredUpdates.Count)] $($update.AppId) $($update.CurrentVersion) -> $($update.AvailableVersion)" -Tag "Run"
 
-        $result = Update-Application -AppId $update.AppId -WingetPath $wingetPath
+        $result = Update-Application -AppId $update.AppId -WingetPath $wingetPath -AvailableVersion $update.AvailableVersion
 
         if ($result -eq $true) {
             $successCount++
