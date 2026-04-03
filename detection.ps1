@@ -11,6 +11,7 @@ $blacklistApps = @(
     'Microsoft.RemoteDesktopClient',
     'Microsoft.GlobalSecureAccessClient',
     'Microsoft.VCLibs.*',
+    'Microsoft.AdministrativeTemplates',
     '3CX.Softphone',
     'TrackerSoftware.PDF-XChange*',
     'Fortinet.FortiClientVPN',
