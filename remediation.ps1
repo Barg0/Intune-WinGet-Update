@@ -655,7 +655,7 @@ function Select-FilteredUpdates {
         if ($ListMode -eq 'Blacklist') {
             if ($null -ne $Blacklist -and $Blacklist.Count -gt 0) {
                 if (Test-AppMatch -AppId $appId -PatternList $Blacklist) {
-                    Write-Log "Blacklist: skip $appId" -Tag "Debug"
+                    Write-Log "Blacklist: $appId" -Tag "Info"
                     continue
                 }
             }
