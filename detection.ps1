@@ -114,15 +114,12 @@ function Write-Log {
 # One-line summary for Intune portal (last console line). Not written to the log file.
 function Build-DetectionPortalSummaryLine {
     param(
-        [bool]$IsCompliant = $true,
-
-        [string[]]$PendingAppIds = @(),
+        [string[]]$AppIds = @(),
 
         [string]$Note = ''
     )
-    $comp = if ($IsCompliant) { 'yes' } else { 'no' }
-    $list = if (@($PendingAppIds).Count -gt 0) { @($PendingAppIds) -join ', ' } else { '(none)' }
-    $line = "Compliant: $comp | Pending: $list"
+    $list = if (@($AppIds).Count -gt 0) { @($AppIds) -join ', ' } else { '(none)' }
+    $line = "Available: $list"
     if (-not [string]::IsNullOrWhiteSpace($Note)) {
         $line += " | $Note"
     }
@@ -479,7 +476,7 @@ function Select-FilteredUpdates {
 try {
     if (-not (Test-Winget)) {
         Write-Log "Winget unavailable." -Tag "Error"
-        Complete-Script -ExitCode 0 -PortalSummaryLine (Build-DetectionPortalSummaryLine -IsCompliant $true -Note 'Winget unavailable')
+        Complete-Script -ExitCode 0 -PortalSummaryLine (Build-DetectionPortalSummaryLine -Note 'Winget unavailable')
     }
 
     # Get available updates
@@ -518,10 +515,10 @@ try {
 
     Write-Log "Detect: $($filteredUpdates.Count) non-compliant" -Tag "Success"
     $pendingIds = foreach ($u in $filteredUpdates) { $u.AppId }
-    Complete-Script -ExitCode 1 -PortalSummaryLine (Build-DetectionPortalSummaryLine -IsCompliant $false -PendingAppIds $pendingIds)
+    Complete-Script -ExitCode 1 -PortalSummaryLine (Build-DetectionPortalSummaryLine -AppIds $pendingIds)
 }
 catch {
     Write-Log "Unhandled: $_" -Tag "Error"
     Write-Log "$($_.ScriptStackTrace)" -Tag "Debug"
-    Complete-Script -ExitCode 1 -PortalSummaryLine 'Compliant: (unknown) | Pending: (unknown) | see detection.log'
+    Complete-Script -ExitCode 1 -PortalSummaryLine 'Available: (unknown) | see detection.log'
 }
