@@ -323,7 +323,7 @@ Updated: (none) | Failed: (none) | Deferred: Contoso.App
 
 ## 📚 References & credits
 
-| Link | Role |
+| Link | Notes |
 |------|------|
 | [**Intune Vita Doctrina** (YouTube)](https://www.youtube.com/@IntuneVitaDoctrina) | Introduced me to the concept of Intune working with WinGet |
 | [Winget-AutoUpdate](https://github.com/Romanitho/Winget-AutoUpdate) | Early inspiration for WinGet automation ideas |
