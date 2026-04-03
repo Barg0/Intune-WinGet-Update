@@ -1,235 +1,333 @@
-# 🚀 Winget - Update Intune Remediation Scripts
+# 🪟 Intune WinGet Update
 
-This repository contains Microsoft Intune Remediation scripts that automatically detect and update Windows applications installed via Winget, with **Blacklist** (exclude apps) or **Whitelist** (include only) modes.
+Scheduled **Microsoft Intune** remediations that use **Windows Package Manager (WinGet)** to find outdated apps and upgrade them.
 
-Based on update detection logic from [Winget-AutoUpdate (WAU)](https://github.com/Romanitho/Winget-AutoUpdate), adapted for Intune's two-script remediation model.
+**Two PowerShell scripts:** detection decides *if* something needs doing; remediation *does* the upgrades.
 
-## 📋 Overview
+---
 
-The remediation consists of two PowerShell scripts:
-- 🔍 **Detection Script** (`detection.ps1`) - Checks if any applications have available updates
-- 🔧 **Remediation Script** (`remediation.ps1`) - Performs the actual application updates
+## 📑 Table of contents
 
-## ✨ Features
+1. [What you get](#-what-you-get)  
+2. [Win32 apps via Intune-WinGet](#-win32-apps-via-intune-winget)  
+3. [WinGet in SYSTEM context (platform script)](#-winget-in-system-context-platform-script)  
+4. [Prerequisites](#-prerequisites)  
+5. [List modes (Blacklist / Whitelist)](#-list-modes-blacklist--whitelist)  
+6. [Deploy in Intune (step by step)](#-deploy-in-intune-step-by-step)  
+7. [Log files & Collect diagnostics](#-log-files--collect-diagnostics)  
+8. [Configuration reference](#-configuration-reference)  
+9. [How remediation fallbacks work](#-how-remediation-fallbacks-work)  
+10. [Exit codes & summary lines](#-exit-codes--summary-lines)  
+11. [Log examples](#-log-examples)  
+12. [Troubleshooting](#-troubleshooting)  
+13. [References & credits](#-references--credits)
 
-- 🚫 **Blacklist** mode (default): update all apps except those listed
-- ⬜ **Whitelist** mode: update only specified apps
-- 🎯 Wildcard pattern matching for app IDs (e.g. `Mozilla.Firefox*`, `*Microsoft*`)
-- 🔄 **Dual-scope detection**: queries both default (machine) and `--scope user` to find all updatable apps
-- 🧠 **Smart scope upgrade**: upgrades without `--scope` first; falls back to `--scope user` only on "no applicable installer" for user-detected apps
-- 📡 **Source health**: runs `winget source update` once at script start before the upgrade loop
-- 📊 **Exit code mapping**: ~45 Winget exit codes categorised into `Success`, `RetryScope`, `RetryLater`, `Fail` (includes MSI 3010 = success)
-- ⏳ **In-progress wait loop**: if another install is running, waits 30s and retries up to 5 times
-- ⏸️ **Deferred updates**: transient errors (disk full, no network, app in use) return exit 0 so Intune retries next cycle
-- 🔁 **Pending reboot detection**: logs when a reboot is pending on the system
-- 📝 Comprehensive logging to `%ProgramData%\IntuneLogs\Scripts\Winget-AppUpdate\`
-- 🌐 UTF-8 encoding handling for proper Unicode/CJK character support
-- 💻 [PowerShell approved verbs](https://learn.microsoft.com/en-us/powershell/scripting/developer/cmdlet/approved-verbs-for-windows-powershell-commands) throughout
-- 📏 camelCase variable naming
+---
 
-## 📦 Requirements
+## ✨ What you get
 
-- 🪟 Windows 10/11 with Winget installed
-- 🔗 Microsoft Entra joined or hybrid joined device
-- 📱 Intune Management Extension installed
-- 💻 PowerShell 5.1 or later
-- 🔐 System context execution (scripts run as SYSTEM)
+- 🔍 **Detection** — Queries WinGet for upgrades, applies your list rules, exits **non-compliant** when updates remain.  
+- 🔧 **Remediation** — Refreshes sources, walks each pending app through an **upgrade ladder**, optional **locale** retry, optional **`install` fallback**, optional **`--uninstall-previous`**, then logs a **one-line portal summary**.  
+- 🎯 **Blacklist or Whitelist** — Wildcards on package IDs (`Mozilla.Firefox*`, …).  
+- ⏳ **Busy installer handling** — Waits and retries when WinGet reports *another installation in progress*.  
+- 📝 **Logs** — `%ProgramData%\IntuneLogs\Scripts\WinGet-Update\` → `detection.log` / `remediation.log`
 
-## 🚀 Deployment Guide
+---
 
-### Step 1: ⚙️ Configure List Mode
+## 📦 Win32 apps via Intune-WinGet
 
-Open both `detection.ps1` and `remediation.ps1` and edit the Config section at the top.
+If you want to **deploy WinGet applications as Intune Win32 apps** (`.intunewin` packages with **install / uninstall / detection** scripts, use this project instead of (or alongside) remediations:
 
-**Blacklist mode** (default) - update all apps except those listed:
+👉 **[github.com/Barg0/Intune-WinGet](https://github.com/Barg0/Intune-WinGet)** — CSV-driven pipeline: **`package.ps1`** builds packages from **`apps.csv`**; **`deploy.ps1`** publishes them to Intune via **Microsoft Graph**. Install templates there share the same kind of **scope / busy-install** retry patterns as this repo.
 
-```powershell
-$listMode = 'Blacklist'
-$blacklistApps = @(
-    'Microsoft.Edge*',
-    'Microsoft.Teams*',
-    'Microsoft.Office',
-    'Mozilla.Firefox*',
-    'Adobe.Acrobat.Reader.64-bit'
-)
+**This repository** (**Intune-WinGet-Update**) only covers **scheduled detection + remediation** to **upgrade** apps that are already installed and visible to WinGet.
+
+---
+
+## ⚙️ WinGet in SYSTEM context (platform script)
+
+🤖 **Detection and remediation here run as SYSTEM.**
+
+On some devices, WinGet can **fail in SYSTEM context** because required **UWP dependencies** — in particular **`Microsoft.VCLibs`** and **`Microsoft.UI.Xaml`** — are not available to the **SYSTEM** account the way they are to an interactive user. Until those paths are registered for SYSTEM, `winget.exe` may not work reliably for platform scripts or Win32 deployments.
+
+1. Deploy **Winget-SystemContext** as an **Intune platform script** (Settings Catalog → **Scripts**, or your tenant’s equivalent) **before** or **alongside** rolling out WinGet-heavy policies.  
+2. The script **registers the UWP dependency paths** so WinGet can run correctly **as SYSTEM**.  
+3. **Without it**, this remediation package or Intune-WinGet **install** scripts may fail on PCs where those dependencies have **never** been made visible to SYSTEM.
+
+**Where to get the script:** [Barg0/Intune-Platform-Scripts — **Winget-SystemContext**](https://github.com/Barg0/Intune-Platform-Scripts/tree/main/Winget-SystemContext)
+
+> 💡 **Scope:** This applies to **SYSTEM**-executed WinGet.
+
+---
+
+## ✅ Prerequisites
+
+| Requirement | Notes |
+|-------------|--------|
+| 🖥️ Windows 10 / 11 | WinGet via **App Installer** (`Microsoft.DesktopAppInstaller`). |
+| ☁️ Intune + Management Extension | Scripts are designed for **SYSTEM** (64-bit PowerShell). |
+| 🔗 Matching config | **`$listMode`** and list arrays must be **identical** in **both** scripts. |
+| 🔧 WinGet healthy as SYSTEM | See [**WinGet in SYSTEM context**](#-winget-in-system-context-platform-script) — deploy **Winget-SystemContext**. |
+
+---
+
+## 🎚️ List modes (Blacklist / Whitelist)
+
+| Mode | Variable | Behavior |
+|------|----------|----------|
+| 🚫 **Blacklist** | `$listMode = 'Blacklist'` | Upgrade **every** WinGet app that has an update **except** IDs matching `$blacklistApps`. |
+| ✅ **Whitelist** | `$listMode = 'Whitelist'` | Upgrade **only** IDs matching `$whitelistApps`. |
+
+**Wildcards** use PowerShell `-like` rules: `*` and `?` work (e.g. `Microsoft.DotNet*`).
+
+**Package IDs** come from `winget list` / `winget search` (**Id** column).
+
+---
+
+## ☁️ Deploy in Intune (step by step)
+
+### 1️⃣ Prepare the files
+
+1. Download this repository.  
+2. Open **`detection.ps1`** and **`remediation.ps1`** in an editor.  
+3. Set **[Configuration reference](#-configuration-reference)** values.  
+4. **Critical:** Copy the **same** `$listMode`, `$blacklistApps`, and `$whitelistApps` into **both** files.
+
+### 2️⃣ Upload the scripts
+
+1. Sign in to the [Microsoft Intune admin center](https://aka.ms/intune).  
+2. Go to **Devices** → **Remediations** (menu names can vary slightly by tenant).  
+3. **Create script package**.  
+4. Name it clearly (e.g. `WinGet Update - Weekly`).  
+5. **Detection script:** upload **`detection.ps1`**.  
+6. **Remediation script:** upload **`remediation.ps1`**.  
+7. Recommended settings:  
+   - **Run using logged-on credentials:** **No** (run as **SYSTEM**).  
+   - **Run in 64-bit PowerShell:** **Yes**.  
+   - **Enforce script signature check:** **No** (unless you sign the scripts).  
+8. **Assign** to device groups.  
+9. **Schedule** (e.g. daily / weekly).
+
+Intune runs **detection** first. Exit **1** = **non-compliant** → **remediation** runs. Exit **0** = compliant → remediation is skipped for that evaluation.
+
+### 3️⃣ Verify
+
+- **Intune:** package → **Device status** / run output.  
+- **Device:** log folder and **Collect diagnostics** setup → [Log files & Collect diagnostics](#-log-files--collect-diagnostics).  
+- **Console:** last line should be the **portal summary** (see below).
+
+---
+
+## 📂 Log files & Collect diagnostics
+
+Scripts write UTF-8 logs here (default folder uses **`$scriptName = 'WinGet-Update'`** in both scripts):
+
+`C:\ProgramData\IntuneLogs\Scripts\WinGet-Update\`
+
+| File | Written by |
+|------|------------|
+| 📄 **`detection.log`** | Detection script |
+| 📄 **`remediation.log`** | Remediation script |
+
+If you change **`$scriptName`**, the folder becomes `...\Scripts\<YourName>\` instead—keep the **same** name in **both** scripts.
+
+📲 **Collect diagnostics in Intune** does not always include arbitrary folders like `ProgramData\IntuneLogs\...` in the diagnostic package. To pull these logs remotely, deploy this **platform script** on devices:
+
+👉 **[Diagnostics - Custom Log File Directory](https://github.com/Barg0/Intune-Platform-Scripts/tree/main/Diagnostics%20-%20Custom%20Log%20File%20Directory)**
+
+That script registers your custom log path with the Intune Management Extension so **Collect diagnostics** can bundle those `.log` files.
+
+**Path (default):**
+
+```text
+C:\ProgramData\IntuneLogs\Scripts\WinGet-Update\
+├── detection.log
+└── remediation.log
 ```
 
-**Whitelist mode** - update only the listed apps:
+---
 
-```powershell
-$listMode = 'Whitelist'
-$whitelistApps = @(
-    '7zip.7zip',
-    'Google.Chrome',
-    'Microsoft.DotNet*',
-    'Microsoft.VCRedist*',
-    'Notepad++.Notepad++'
-)
+## 🎛️ Configuration reference
+
+### 🔗 In **both** `detection.ps1` and `remediation.ps1` (must match)
+
+| Setting | Purpose |
+|---------|---------|
+| `$listMode` | `'Blacklist'` or `'Whitelist'`. |
+| `$blacklistApps` | String array of IDs/patterns to **exclude** in Blacklist mode. |
+| `$whitelistApps` | String array of IDs/patterns to **include** in Whitelist mode. |
+| `$log`, `$logDebug`, `$logGet`, `$logRun`, `$enableLogFile` | Control console/file logging verbosity. |
+| `$scriptName` | Log folder name under `...\Scripts\<name>\`. Keep **same** in both scripts if you change it. |
+
+### 🔧 Only in **`remediation.ps1`**
+
+| Setting | Default (typical) | Purpose |
+|---------|-------------------|---------|
+| `$wingetLocaleWorkaround` | `'en-US'` | After a failed **first** locale pass ending in **“No packages found”** (`0x8A150014`), repeats the **full upgrade ladder** with `--locale`. Use `''` to disable. |
+| `$wingetAllowInstallFallback` | `$false` | If **`$true`**, after upgrades still fail with **5212** and **`AvailableVersion`** is known, tries **`winget install --id … --version … --force`** across machine → default → user scopes. |
+| `$wingetAllowUninstallPrevious` | `$false` | If **`$true`**, last resort: **`winget upgrade … --uninstall-previous`** (high impact if reinstall fails). |
+
+---
+
+## 🔁 How remediation fallbacks work
+
+### 1. ⬆️ Upgrade ladder (every attempt wrapped for “installer busy”)
+
+For each **locale pass** (normal, then optional `--locale` workaround):
+
+1. **`winget upgrade`** with **`--scope machine`** (`--source winget`, `-e`, `--force`, agreements, silent).  
+2. If WinGet indicates **wrong scope / no package / no applicable** (and not a hard stop), retry **without** `--scope`.  
+3. If still needed, retry with **`--scope user`**.  
+
+Success is accepted only if WinGet’s category is **Success** *and* the output does not claim a bogus “no applicable upgrade” (guards false **exit 0**).
+
+### 2. 🩹 Per-invocation repairs (inside the ladder)
+
+- **Hash mismatch** → `winget source update --name winget`, then **same** scope command again.  
+- **Transient download errors** → sleep **`$wingetDownloadRetryWaitSeconds`**, then **one** repeat of the same scope command.
+
+### 3. 🗂️ Source repair (once per app, if needed)
+
+If WinGet reports **corrupt / missing source** (mapped as **RetrySourceRepair**), the script runs **`winget source reset --force`** and **`winget source update`**, then runs the **whole machine → default → user ladder again** (same locale pass).
+
+### 4. 🌐 Locale pass (optional)
+
+If **`$wingetLocaleWorkaround`** is non-empty and the **first** pass ends with **5212**, the **entire ladder** (including source repair logic) runs again with **`--locale`**.
+
+### 5. 📥 Install fallback (optional, **`$wingetAllowInstallFallback`**)
+
+If still **5212** and the detection list supplied **`AvailableVersion`**, the script can run **`winget install --id … --version … --force`** in **machine → default → user** order. This uses the **catalog** instead of relying on upgrade’s installed-app matching (helps with known WinGet edge cases).
+
+### 6. ♻️ Uninstall-previous (optional, **`$wingetAllowUninstallPrevious`**)
+
+If enabled, runs **`winget upgrade`** with **`--uninstall-previous`** (and version) across scopes. **Uninstalls the old build before installing the new one** — test thoroughly before enabling.
+
+### 🔍 Detection script behavior (no “fallbacks” like remediation)
+
+- Three **`winget upgrade --source winget`** list passes: **no scope**, **`--scope user`**, **`--scope machine`**, merged by **App ID**.  
+- Rows with **Unknown** version are skipped.  
+- **No** install / uninstall-previous / override logic.
+
+---
+
+## 🚦 Exit codes & summary lines
+
+### 🔎 Detection
+
+| Exit | Meaning |
+|------|---------|
+| **0** | Compliant: no pending updates after filters, **or** WinGet unavailable (intentionally **no** remediation trigger). |
+| **1** | Non-compliant: at least one filtered update pending. |
+
+**Last console line (examples):**
+
+- `Compliant: yes | Pending: (none)`  
+- `Compliant: no | Pending: Google.Chrome, 7zip.7zip`  
+- `Compliant: yes | Pending: (none) | Winget unavailable`  
+- `Compliant: (unknown) | Pending: (unknown) | see detection.log` (unhandled error)
+
+### 🛠️ Remediation
+
+| Exit | Meaning |
+|------|---------|
+| **0** | No **hard** failures (some apps may be **deferred**). |
+| **1** | At least one app **failed** after all enabled steps. |
+
+**Last console line (examples):**
+
+- `Updated: 7zip.7zip, Google.Chrome | Failed: (none)`  
+- `Updated: 7zip.7zip | Failed: Vendor.App | Deferred: BigInstaller`  
+- `Updated: (none) | Failed: (none) | Winget unavailable`
+
+---
+
+## 📋 Log examples
+
+Timestamps and versions are illustrative.
+
+### ✅ Detection — compliant (no updates)
+
+```text
+2026-03-29 09:00:00 [ Start   ] ==================== Start ====================
+2026-03-29 09:00:00 [ Info    ] Host DESKTOP01 | SYSTEM | WinGet-Update
+2026-03-29 09:00:02 [ Get     ] Upgrades: 0
+2026-03-29 09:00:02 [ Success ] No upgrades
+2026-03-29 09:00:02 [ Info    ] Runtime 00:00:02.10
+2026-03-29 09:00:02 [ Info    ] Exit 0
+2026-03-29 09:00:02 [ End     ] ==================== End ====================
+Compliant: yes | Pending: (none)
 ```
 
-⚠️ Both scripts must have the **same** `$listMode` and list configuration.
+### ⚠️ Detection — non-compliant
 
-### Step 2: 📝 Configure Logging (Optional)
-
-For production, disable debug logging:
-
-```powershell
-$logDebug = $false
+```text
+2026-03-29 09:05:00 [ Get     ] Upgrades: 4
+2026-03-29 09:05:01 [ Get     ] Filtered: 2
+2026-03-29 09:05:01 [ Info    ] Available:
+2026-03-29 09:05:01 [ Info    ]   Google.Chrome 131.0.0 -> 132.0.0
+2026-03-29 09:05:01 [ Info    ]   7zip.7zip 24.08 -> 24.09 [machine]
+2026-03-29 09:05:01 [ Success ] Detect: 2 non-compliant
+2026-03-29 09:05:01 [ Info    ] Runtime 00:00:03.05
+2026-03-29 09:05:01 [ Info    ] Exit 1
+2026-03-29 09:05:01 [ End     ] ==================== End ====================
+Compliant: no | Pending: Google.Chrome, 7zip.7zip
 ```
 
-### Step 3: ☁️ Upload Scripts to Intune
+### ✅ Remediation — success after scope retry
 
-1. 🌐 Go to [Microsoft Intune Admin Center](https://endpoint.microsoft.com) > **Devices** > **Remediations**
-2. ➕ Click **+ Create script package**
-3. 📤 Upload `detection.ps1` as the detection script
-4. 📤 Upload `remediation.ps1` as the remediation script
-5. ⚙️ Configure:
-   - **Run this script using the logged-on credentials**: No (system context)
-   - **Enforce script signature check**: No (unless you sign the scripts)
-   - **Run script in 64-bit PowerShell**: Yes
-6. 👥 Assign to device groups
-7. ⏰ Schedule (e.g. daily)
-
-### Step 4: 📊 Monitor Execution
-
-- 📈 **Intune Portal**: Devices > Remediations > select package > Device status
-- 📂 **On-device logs**: `%ProgramData%\IntuneLogs\Scripts\Winget-AppUpdate\`
-  - `detection.log`
-  - `remediation.log`
-
-## 🔧 How It Works
-
-### Scope Detection Strategy
-
-The scripts query Winget twice for available updates:
-
-1. **`winget upgrade --source winget`** (no `--scope` flag) - returns machine-scoped apps by default
-2. **`winget upgrade --source winget --scope user`** - returns additional user-scoped apps
-
-Each app is tagged with its detected scope. Results are deduplicated by AppId, preferring the default (no-scope) entry when an app appears in both.
-
-### Upgrade Strategy
-
-When upgrading, the script always tries **without** `--scope` first (letting Winget auto-detect the correct scope). This works for the majority of apps. If Winget returns "no applicable installer for current scope" (`-1978335216`) **and** the app was originally detected as user-scoped, the script retries once with `--scope user`.
-
-### Exit Code Categories
-
-| Category | Meaning | Script Action |
-|----------|---------|---------------|
-| ✅ Success | App is at desired state | Count as success |
-| 🔄 RetryScope | No installer for detected scope | Retry with `--scope user` if user-detected |
-| ⏸️ RetryLater | Transient error (app in use, network, disk) | Return `$null` (deferred); Intune retries next cycle |
-| ❌ Fail | Unrecoverable (policy, hash mismatch, unsupported) | Return `$false`; logged as error |
-| ❓ Unknown | Unmapped code | Treated as Fail; hex value logged for lookup |
-
-Notable: MSI exit code **3010** (`ERROR_SUCCESS_REBOOT_REQUIRED`) is treated as Success since the install actually completed.
-
-### Three-State Result Model
-
-`Update-Application` returns one of three values:
-
-- ✅ `$true` - upgrade succeeded
-- ❌ `$false` - hard failure (unrecoverable)
-- ⏸️ `$null` - deferred (transient error; Intune retries next cycle)
-
-Only hard failures (`$false`) cause the script to exit with code 1. Deferred updates exit 0 so Intune does not flag them as failures.
-
-## 🚫 Blacklist / Whitelist Configuration
-
-### Wildcard Support
-
-Patterns use PowerShell's `-like` operator:
-
-| Pattern | Matches | Does Not Match |
-|---------|---------|----------------|
-| `Mozilla.Firefox*` | `Mozilla.Firefox`, `Mozilla.Firefox.ESR` | `Other.Firefox` |
-| `*Firefox` | `Mozilla.Firefox`, `Other.Firefox` | `Firefox.Standalone` |
-| `Microsoft.VCLibs.*` | `Microsoft.VCLibs.140.00` | `Microsoft.VCLibs` |
-| `Microsoft.Office` | `Microsoft.Office` (exact) | `Microsoft.Office365` |
-
-### Finding App IDs
-
-```powershell
-winget list                          # All installed apps
-winget search "AppName"              # Search by name
-winget list | Select-String "Chrome"  # Filter installed apps
+```text
+2026-03-29 09:10:00 [ Run     ] WinGet source update
+2026-03-29 09:10:02 [ Run     ] [1/2] Google.Chrome 131.0.0 -> 132.0.0
+2026-03-29 09:10:05 [ Info    ] Retry: no --scope
+2026-03-29 09:10:40 [ Success ] Google.Chrome (default scope)
+2026-03-29 09:10:43 [ Run     ] [2/2] 7zip.7zip 24.08 -> 24.09
+2026-03-29 09:10:55 [ Success ] 7zip.7zip (machine)
+2026-03-29 09:10:55 [ Success ] OK count: 2
+2026-03-29 09:10:55 [ Success ] Done (no hard failures)
+2026-03-29 09:10:55 [ Info    ] Runtime 00:00:55.20
+2026-03-29 09:10:55 [ Info    ] Exit 0
+2026-03-29 09:10:55 [ End     ] ==================== End ====================
+Updated: Google.Chrome, 7zip.7zip | Failed: (none)
 ```
 
-## 📝 Logging
+### ⏸️ Remediation — defer (installer busy)
 
-### Log Tags
-
-| Tag | Meaning |
-|-----|---------|
-| 🚀 Start/End | Script lifecycle |
-| 🔍 Get | Data retrieval (Winget queries, parsing) |
-| ⚙️ Run | Execution (upgrade commands, source update) |
-| ℹ️ Info | Progress, configuration |
-| ✅ Success | Successful operations |
-| ❌ Error | Failures |
-| 🐛 Debug | Verbose detail (disable with `$logDebug = $false`) |
-
-### Example Log Output
-
-```
-2026-02-26 10:00:00 [  Start   ] ======== Script Started ========
-2026-02-26 10:00:00 [  Info    ] ComputerName: PC01 | User: SYSTEM | Script: Winget-AppUpdate
-2026-02-26 10:00:00 [  Run     ] Refreshing winget sources...
-2026-02-26 10:00:02 [  Debug   ] Source refresh complete.
-2026-02-26 10:00:02 [  Get     ] Checking for available updates (default + user scope)
-2026-02-26 10:00:05 [  Debug   ] Default scope: found 3 app(s) with updates
-2026-02-26 10:00:08 [  Debug   ] User scope: found 1 app(s) with updates
-2026-02-26 10:00:08 [  Get     ] Found 4 unique apps with available updates
-2026-02-26 10:00:08 [  Info    ] Using blacklist mode with 17 entries
-2026-02-26 10:00:08 [  Get     ] Filtered to 3 apps requiring updates
-2026-02-26 10:00:08 [  Run     ] Starting update process for 3 application(s)
-2026-02-26 10:00:08 [  Info    ] [1/3] Processing: 7zip.7zip (24.08 -> 24.09)
-2026-02-26 10:00:15 [  Success ] Successfully updated: 7zip.7zip
-2026-02-26 10:00:18 [  Info    ] [2/3] Processing: Google.Chrome (131.0.0 -> 132.0.0) [user]
-2026-02-26 10:00:25 [  Info    ] No applicable installer without scope; retrying Google.Chrome with --scope user.
-2026-02-26 10:00:32 [  Success ] Successfully updated: Google.Chrome (with --scope user)
-2026-02-26 10:00:35 [  Info    ] [3/3] Processing: SomeApp (1.0 -> 2.0)
-2026-02-26 10:00:40 [  Info    ] Transient error for SomeApp (Application is currently running); will retry next Intune cycle.
-2026-02-26 10:00:40 [  Success ] Successfully updated: 2 application(s)
-2026-02-26 10:00:40 [  Info    ] Deferred (transient): 1 application(s) - SomeApp
-2026-02-26 10:00:40 [  Success ] All updates completed or deferred successfully
-2026-02-26 10:00:40 [  Info    ] Exit Code: 0
+```text
+2026-03-29 10:00:00 [ Run     ] [1/1] Contoso.App 1.0 -> 1.1
+2026-03-29 10:00:05 [ Info    ] Install busy; wait 120s (1/15)
+...
+2026-03-29 10:25:00 [ Info    ] Defer Contoso.App: install busy (max waits)
+2026-03-29 10:25:00 [ Success ] OK count: 0
+2026-03-29 10:25:00 [ Info    ] Deferred (1): Contoso.App
+2026-03-29 10:25:00 [ Info    ] Exit 0
+2026-03-29 10:25:00 [ End     ] ==================== End ====================
+Updated: (none) | Failed: (none) | Deferred: Contoso.App
 ```
 
-## 🔧 Troubleshooting
+*(Enable **`$logDebug = $true`** to see full `winget` command lines in the log.)*
 
-### ❌ Winget Not Found
+---
 
-Script fails with "Winget is not available or not working properly".
+## 🆘 Troubleshooting
 
-- ✅ Ensure `Microsoft.DesktopAppInstaller` is installed
-- 📂 Check `%ProgramFiles%\WindowsApps\Microsoft.DesktopAppInstaller_*`
-- 🔍 Run `winget --version` manually to verify
-- 🔐 Ensure the script runs in system context
+| Symptom | Check |
+|---------|--------|
+| 🔕 Detection never triggers | Same lists/mode in **both** scripts; correct **package IDs**. |
+| ❌ Remediation exit **1** | `remediation.log` → **Fail** lines; compare codes with [WinGet return codes](https://github.com/microsoft/winget-cli/blob/master/doc/windows/package-manager/winget/returnCodes.md). |
+| 🐛 One package always fails | Blacklist it temporarily; test **`install` fallback** / **`uninstall-previous`** only with care. |
+| 📭 WinGet missing | Deploy / repair **App Installer**; remediation exits **1** if WinGet is required and missing. |
+| 🤖 WinGet fails only as **SYSTEM** (works for users) | Deploy **[Winget-SystemContext](https://github.com/Barg0/Intune-Platform-Scripts/tree/main/Winget-SystemContext)**; see [WinGet in SYSTEM context](#-winget-in-system-context-platform-script). |
+| 📦 **Collect diagnostics** missing these logs | Deploy **[Diagnostics - Custom Log File Directory](https://github.com/Barg0/Intune-Platform-Scripts/tree/main/Diagnostics%20-%20Custom%20Log%20File%20Directory)**; see [Log files & Collect diagnostics](#-log-files--collect-diagnostics). |
 
-### 🔍 Updates Not Detected
+---
 
-Detection script returns exit code 0 but updates are available.
+## 📚 References & credits
 
-- ✅ Verify app IDs match Winget package IDs (`winget list`)
-- 📝 Check blacklist/whitelist for typos
-- 📋 Review detection logs for parsing errors
-- ⚠️ Check if apps have "Unknown" versions (skipped by design)
-
-### ⬆️ Updates Fail During Remediation
-
-Remediation script returns exit code 1.
-
-- 📋 Check remediation logs for the exit code and category
-- 🔄 **RetryScope**: the script already retries with `--scope user` for user-detected apps; if it still fails the manifest may not support upgrade
-- ⏸️ **RetryLater / deferred**: not counted as failures; Intune retries next cycle
-- ❌ **Fail**: requires manual intervention (policy change, dependency install, etc.)
-- ❓ **Unknown**: the log includes hex value for lookup on [MS return codes](https://github.com/microsoft/winget-cli/blob/master/doc/windows/package-manager/winget/returnCodes.md)
-
-### 🌐 Encoding Issues
-
-App names show garbled characters. The scripts set `[Console]::OutputEncoding` to UTF-8 before calling Winget. Ensure you are using the latest version of the scripts.
-
-## 🙏 Credits
-
-Based on the excellent work by [Romanitho/Winget-AutoUpdate](https://github.com/Romanitho/Winget-AutoUpdate).
+| Link | Role |
+|------|------|
+| [**Intune Vita Doctrina** (YouTube)](https://www.youtube.com/@IntuneVitaDoctrina) | Introduced me to the concept of Intune working with WinGet |
+| [Winget-AutoUpdate](https://github.com/Romanitho/Winget-AutoUpdate) | Early inspiration for WinGet automation ideas |
+| [WinGet](https://learn.microsoft.com/windows/package-manager/winget/) | Product documentation |
+| [winget upgrade](https://learn.microsoft.com/windows/package-manager/winget/upgrade) | Upgrade command |
+| [WinGet return codes](https://github.com/microsoft/winget-cli/blob/master/doc/windows/package-manager/winget/returnCodes.md) | HRESULT reference |
+| [Intune remediations](https://learn.microsoft.com/mem/intune/fundamentals/powershell-scripts-remediation) | Policy type |
