@@ -110,9 +110,30 @@ function Write-Log {
     Write-Host "$message"
 }
 
+# One-line summary for Intune portal (last console line). Not written to the log file.
+function Build-DetectionPortalSummaryLine {
+    param(
+        [bool]$IsCompliant = $true,
+
+        [string[]]$PendingAppIds = @(),
+
+        [string]$Note = ''
+    )
+    $comp = if ($IsCompliant) { 'yes' } else { 'no' }
+    $list = if (@($PendingAppIds).Count -gt 0) { @($PendingAppIds) -join ', ' } else { '(none)' }
+    $line = "Compliant: $comp | Pending: $list"
+    if (-not [string]::IsNullOrWhiteSpace($Note)) {
+        $line += " | $Note"
+    }
+    return $line
+}
+
 # ---------------------------[ Exit Function ]---------------------------
 function Complete-Script {
-    param([int]$ExitCode)
+    param(
+        [int]$ExitCode,
+        [string]$PortalSummaryLine = $null
+    )
 
     $scriptEndTime = Get-Date
     $duration      = $scriptEndTime - $scriptStartTime
@@ -120,6 +141,10 @@ function Complete-Script {
     Write-Log "Runtime $($duration.ToString('hh\:mm\:ss\.ff'))" -Tag "Info"
     Write-Log "Exit $ExitCode" -Tag "Info"
     Write-Log "==================== End ====================" -Tag "End"
+
+    if (-not [string]::IsNullOrEmpty($PortalSummaryLine)) {
+        Write-Host $PortalSummaryLine
+    }
 
     exit $ExitCode
 }
@@ -453,7 +478,7 @@ function Select-FilteredUpdates {
 try {
     if (-not (Test-Winget)) {
         Write-Log "Winget unavailable." -Tag "Error"
-        Complete-Script -ExitCode 0 # If WingGet isn't available, we shall not remediate.
+        Complete-Script -ExitCode 0 -PortalSummaryLine (Build-DetectionPortalSummaryLine -IsCompliant $true -Note 'Winget unavailable')
     }
 
     # Get available updates
@@ -461,7 +486,7 @@ try {
 
     if ($availableUpdates.Count -eq 0) {
         Write-Log "No upgrades" -Tag "Success"
-        Complete-Script -ExitCode 0
+        Complete-Script -ExitCode 0 -PortalSummaryLine (Build-DetectionPortalSummaryLine)
     }
 
     if ($listMode -eq 'Blacklist') {
@@ -477,7 +502,7 @@ try {
 
     if ($filteredUpdates.Count -eq 0) {
         Write-Log "No upgrades after filter" -Tag "Success"
-        Complete-Script -ExitCode 0
+        Complete-Script -ExitCode 0 -PortalSummaryLine (Build-DetectionPortalSummaryLine)
     }
 
     Write-Log "Available:" -Tag "Info"
@@ -491,10 +516,11 @@ try {
     }
 
     Write-Log "Detect: $($filteredUpdates.Count) non-compliant" -Tag "Success"
-    Complete-Script -ExitCode 1
+    $pendingIds = foreach ($u in $filteredUpdates) { $u.AppId }
+    Complete-Script -ExitCode 1 -PortalSummaryLine (Build-DetectionPortalSummaryLine -IsCompliant $false -PendingAppIds $pendingIds)
 }
 catch {
     Write-Log "Unhandled: $_" -Tag "Error"
     Write-Log "$($_.ScriptStackTrace)" -Tag "Debug"
-    Complete-Script -ExitCode 1
+    Complete-Script -ExitCode 1 -PortalSummaryLine 'Compliant: (unknown) | Pending: (unknown) | see detection.log'
 }
