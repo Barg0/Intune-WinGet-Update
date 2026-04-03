@@ -221,10 +221,10 @@ If enabled, runs **`winget upgrade`** with **`--uninstall-previous`** (and versi
 
 **Last console line (examples):**
 
-- `Compliant: yes | Pending: (none)`  
-- `Compliant: no | Pending: Google.Chrome, 7zip.7zip`  
-- `Compliant: yes | Pending: (none) | Winget unavailable`  
-- `Compliant: (unknown) | Pending: (unknown) | see detection.log` (unhandled error)
+- `Available: (none)`  
+- `Available: Google.Chrome, 7zip.7zip`  
+- `Available: (none) | Winget unavailable`  
+- `Available: (unknown) | see detection.log` (unhandled error)
 
 ### 🛠️ Remediation
 
@@ -255,7 +255,7 @@ Timestamps and versions are illustrative.
 2026-03-29 09:00:02 [ Info    ] Runtime 00:00:02.10
 2026-03-29 09:00:02 [ Info    ] Exit 0
 2026-03-29 09:00:02 [ End     ] ==================== End ====================
-Compliant: yes | Pending: (none)
+Available: (none)
 ```
 
 ### ⚠️ Detection — non-compliant
@@ -270,7 +270,7 @@ Compliant: yes | Pending: (none)
 2026-03-29 09:05:01 [ Info    ] Runtime 00:00:03.05
 2026-03-29 09:05:01 [ Info    ] Exit 1
 2026-03-29 09:05:01 [ End     ] ==================== End ====================
-Compliant: no | Pending: Google.Chrome, 7zip.7zip
+Available: Google.Chrome, 7zip.7zip
 ```
 
 ### ✅ Remediation — success after scope retry
