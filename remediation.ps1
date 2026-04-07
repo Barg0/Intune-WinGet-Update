@@ -52,14 +52,19 @@ $wingetInProgressWaitSeconds     = 120
 $wingetDownloadRetryWaitSeconds  = 30
 
 # When all upgrade attempts fail with 0x8A150014 ("No packages found"), fall back to `winget install --version --force`.
-# The install command resolves against source manifests instead of ARP entries, bypassing the matching bug. Set to $false to disable.
-$wingetAllowInstallFallback      = $false
+# The install command resolves against source manifests instead of ARP entries, bypassing the matching bug.
+# Only AppIds matching a pattern here may use this workaround. Wildcards supported (same as blacklist). Empty @() = never.
+# @('*') = allow for every package.
+$wingetInstallFallbackAllowlist = @(
+    # 'Contoso.ExampleApp'
+)
 
-# LAST RESORT: if every upgrade and install attempt fails, try `winget upgrade --uninstall-previous`.
-# This uninstalls the existing version before installing the new one. Effective when the old installer
-# conflicts with the upgrade (ShellExecute failures, installer-type mismatches), but destructive if it
-# succeeds at uninstall but fails at install — the app will be gone. Set to $false to disable.
-$wingetAllowUninstallPrevious    = $false
+# LAST RESORT: `winget upgrade --uninstall-previous`. Uninstalls the existing version before installing the new one.
+# Destructive if uninstall succeeds but install fails. Only AppIds matching a pattern here may use this workaround.
+# Empty @() = never. @('*') = allow for every package.
+$wingetUninstallPreviousAllowlist = @(
+    # 'Contoso.ExampleApp'
+)
 
 # ---------------------------[ Script Start Timestamp ]---------------------------
 $scriptStartTime = Get-Date
@@ -717,7 +722,7 @@ function Update-Application {
 
             [string]$Locale
         )
-        $wingetArgs = @('upgrade', '--id', $AppId, '-e', '--force', '--accept-package-agreements', '--accept-source-agreements', '-h', '--source', 'winget')
+        $wingetArgs = @('upgrade', '--id', $AppId, '-e', '--force', '--accept-package-agreements', '--accept-source-agreements', '-h', '--disable-interactivity', '--source', 'winget')
         if (-not [string]::IsNullOrWhiteSpace($Locale)) { $wingetArgs += '--locale', $Locale.Trim() }
         if ($ScopeMode -eq 'Machine') { $wingetArgs += '--scope', 'machine' }
         elseif ($ScopeMode -eq 'User') { $wingetArgs += '--scope', 'user' }
@@ -905,13 +910,13 @@ function Update-Application {
             # Install fallback: if all upgrade paths failed with 0x8A150014, try winget install --version.
             # The install command resolves packages against the source manifest rather than ARP entries,
             # bypassing the matching bug that causes upgrade to return "No packages found" (winget-cli #5249, #6095).
-            if ($wingetAllowInstallFallback -and $exitCode -eq -1978335212 -and -not [string]::IsNullOrWhiteSpace($AvailableVersion)) {
+            if ((Test-AppMatch -AppId $AppId -PatternList @($wingetInstallFallbackAllowlist)) -and $exitCode -eq -1978335212 -and -not [string]::IsNullOrWhiteSpace($AvailableVersion)) {
                 Write-Log "Retry: install fallback (winget install --version $AvailableVersion)" -Tag "Info"
                 foreach ($iScope in @('Machine', 'Default', 'User')) {
                     if ($iScope -ne 'Machine') { Write-Log "Retry: $($iScope.ToLower()) scope (install)" -Tag "Info" }
 
                     $installArgs = @('install', '--id', $AppId, '-e', '--version', $AvailableVersion, '--force',
-                        '--accept-package-agreements', '--accept-source-agreements', '-h', '--source', 'winget')
+                        '--accept-package-agreements', '--accept-source-agreements', '-h', '--disable-interactivity', '--source', 'winget')
                     if ($iScope -eq 'Machine') { $installArgs += '--scope', 'machine' }
                     elseif ($iScope -eq 'User') { $installArgs += '--scope', 'user' }
                     Write-Log "winget $($installArgs -join ' ')" -Tag "Debug"
@@ -937,14 +942,14 @@ function Update-Application {
             }
 
             # Last resort: --uninstall-previous removes the old version first, then installs the new one.
-            # Risky: if uninstall succeeds but install fails, the app is gone. Gated by $wingetAllowUninstallPrevious.
-            if ($wingetAllowUninstallPrevious -and -not [string]::IsNullOrWhiteSpace($AvailableVersion)) {
+            # Risky: if uninstall succeeds but install fails, the app is gone. Gated by $wingetUninstallPreviousAllowlist.
+            if ((Test-AppMatch -AppId $AppId -PatternList @($wingetUninstallPreviousAllowlist)) -and -not [string]::IsNullOrWhiteSpace($AvailableVersion)) {
                 Write-Log "Retry: uninstall-previous" -Tag "Info"
                 foreach ($uScope in @('Machine', 'Default', 'User')) {
                     if ($uScope -ne 'Machine') { Write-Log "Retry: $($uScope.ToLower()) scope (uninstall-previous)" -Tag "Info" }
 
                     $uninstPrevArgs = @('upgrade', '--id', $AppId, '-e', '--version', $AvailableVersion, '--force',
-                        '--uninstall-previous', '--accept-package-agreements', '--accept-source-agreements', '-h', '--source', 'winget')
+                        '--uninstall-previous', '--accept-package-agreements', '--accept-source-agreements', '-h', '--disable-interactivity', '--source', 'winget')
                     if ($uScope -eq 'Machine') { $uninstPrevArgs += '--scope', 'machine' }
                     elseif ($uScope -eq 'User') { $uninstPrevArgs += '--scope', 'user' }
                     Write-Log "winget $($uninstPrevArgs -join ' ')" -Tag "Debug"

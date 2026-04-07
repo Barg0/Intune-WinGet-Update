@@ -27,7 +27,7 @@ Scheduled **Microsoft Intune** remediations that use **Windows Package Manager (
 ## ✨ What you get
 
 - 🔍 **Detection** — Queries WinGet for upgrades, applies your list rules, exits **non-compliant** when updates remain.  
-- 🔧 **Remediation** — Refreshes sources, walks each pending app through an **upgrade ladder**, optional **locale** retry, optional **`install` fallback**, optional **`--uninstall-previous`**, then logs a **one-line portal summary**.  
+- 🔧 **Remediation** — Refreshes sources, walks each pending app through an **upgrade ladder**, optional **locale** retry, optional **`install` fallback** and **`--uninstall-previous`** (each gated by **per-app allowlists**), **`--silent`** plus **`--disable-interactivity`** on WinGet invocations, then logs a **one-line portal summary**.  
 - 🎯 **Blacklist or Whitelist** — Wildcards on package IDs (`Mozilla.Firefox*`, …).  
 - ⏳ **Busy installer handling** — Waits and retries when WinGet reports *another installation in progress*.  
 - 📝 **Logs** — `%ProgramData%\IntuneLogs\Scripts\WinGet-Update\` → `detection.log` / `remediation.log`
@@ -164,8 +164,10 @@ C:\ProgramData\IntuneLogs\Scripts\WinGet-Update\
 | Setting | Default (typical) | Purpose |
 |---------|-------------------|---------|
 | `$wingetLocaleWorkaround` | `'en-US'` | After a failed **first** locale pass ending in **“No packages found”** (`0x8A150014`), repeats the **full upgrade ladder** with `--locale`. Use `''` to disable. |
-| `$wingetAllowInstallFallback` | `$false` | If **`$true`**, after upgrades still fail with **5212** and **`AvailableVersion`** is known, tries **`winget install --id … --version … --force`** across machine → default → user scopes. |
-| `$wingetAllowUninstallPrevious` | `$false` | If **`$true`**, last resort: **`winget upgrade … --uninstall-previous`** (high impact if reinstall fails). |
+| `$wingetInstallFallbackAllowlist` | `@()` | **App ID patterns** allowed to use **`winget install --version`** when upgrades end with **no packages found** (`0x8A150014`) and **`AvailableVersion`** is known. Same wildcard rules as blacklist (`*` / `?`). **`@()`** = never; **`@('*')`** = all packages. |
+| `$wingetUninstallPreviousAllowlist` | `@()` | **App ID patterns** allowed to use last-resort **`winget upgrade … --uninstall-previous`**. **`@()`** = never; **`@('*')`** = all packages. High impact if uninstall succeeds but install fails. |
+| `$wingetInProgressMaxRetries` / `$wingetInProgressWaitSeconds` | `15` / `120` | When WinGet reports *another installation in progress*, wait and retry that upgrade attempt (see script comments). |
+| `$wingetDownloadRetryWaitSeconds` | `30` | Sleep before **one** retry after transient **download** errors (mapped in script). |
 
 ---
 
@@ -175,7 +177,7 @@ C:\ProgramData\IntuneLogs\Scripts\WinGet-Update\
 
 For each **locale pass** (normal, then optional `--locale` workaround):
 
-1. **`winget upgrade`** with **`--scope machine`** (`--source winget`, `-e`, `--force`, agreements, silent).  
+1. **`winget upgrade`** with **`--scope machine`** (`--source winget`, `-e`, `--force`, **`--accept-package-agreements`**, **`--accept-source-agreements`**, **`-h` / `--silent`**, **`--disable-interactivity`** — see [winget upgrade](https://learn.microsoft.com/windows/package-manager/winget/upgrade)).  
 2. If WinGet indicates **wrong scope / no package / no applicable** (and not a hard stop), retry **without** `--scope`.  
 3. If still needed, retry with **`--scope user`**.  
 
@@ -194,19 +196,19 @@ If WinGet reports **corrupt / missing source** (mapped as **RetrySourceRepair**)
 
 If **`$wingetLocaleWorkaround`** is non-empty and the **first** pass ends with **5212**, the **entire ladder** (including source repair logic) runs again with **`--locale`**.
 
-### 5. 📥 Install fallback (optional, **`$wingetAllowInstallFallback`**)
+### 5. 📥 Install fallback (optional, **`$wingetInstallFallbackAllowlist`**)
 
-If still **5212** and the detection list supplied **`AvailableVersion`**, the script can run **`winget install --id … --version … --force`** in **machine → default → user** order. This uses the **catalog** instead of relying on upgrade’s installed-app matching (helps with known WinGet edge cases).
+If the current **`AppId`** matches **`$wingetInstallFallbackAllowlist`** (wildcards supported; **`@('*')`** = all apps), the exit code is still **no packages found** (`0x8A150014` / **-1978335212**), and the detection list supplied **`AvailableVersion`**, the script runs **`winget install --id … --version … --force`** in **machine → default → user** order. This uses the **catalog** instead of relying on upgrade’s installed-app matching (helps with known WinGet edge cases). With an **empty** allowlist **`@()`**, this path never runs.
 
-### 6. ♻️ Uninstall-previous (optional, **`$wingetAllowUninstallPrevious`**)
+### 6. ♻️ Uninstall-previous (optional, **`$wingetUninstallPreviousAllowlist`**)
 
-If enabled, runs **`winget upgrade`** with **`--uninstall-previous`** (and version) across scopes. **Uninstalls the old build before installing the new one** — test thoroughly before enabling.
+If the **`AppId`** matches **`$wingetUninstallPreviousAllowlist`** and **`AvailableVersion`** is set, the script runs **`winget upgrade`** with **`--uninstall-previous`** (and version) across scopes. **Uninstalls the old build before installing the new one** — default allowlist is **`@()`** (off); add only IDs you accept risk on, or use **`@('*')`** only after thorough testing.
 
 ### 🔍 Detection script behavior (no “fallbacks” like remediation)
 
-- Three **`winget upgrade --source winget`** list passes: **no scope**, **`--scope user`**, **`--scope machine`**, merged by **App ID**.  
+- Three **`winget upgrade --disable-interactivity --source winget`** list passes: **no scope**, **`--scope user`**, **`--scope machine`**, merged by **App ID**.  
 - Rows with **Unknown** version are skipped.  
-- **No** install / uninstall-previous / override logic.
+- **No** install / uninstall-previous / override logic (those exist only in **remediation**, with allowlists).
 
 ---
 
@@ -314,7 +316,7 @@ Updated: (none) | Failed: (none) | Deferred: Contoso.App
 |---------|--------|
 | 🔕 Detection never triggers | Same lists/mode in **both** scripts; correct **package IDs**. |
 | ❌ Remediation exit **1** | `remediation.log` → **Fail** lines; compare codes with [WinGet return codes](https://github.com/microsoft/winget-cli/blob/master/doc/windows/package-manager/winget/returnCodes.md). |
-| 🐛 One package always fails | Blacklist it temporarily; test **`install` fallback** / **`uninstall-previous`** only with care. |
+| 🐛 One package always fails | Blacklist it temporarily; if appropriate, add its ID to **`$wingetInstallFallbackAllowlist`** or **`$wingetUninstallPreviousAllowlist`** (avoid **`@('*')`** until tested). |
 | 📭 WinGet missing | Deploy / repair **App Installer**; remediation exits **1** if WinGet is required and missing. |
 | 🤖 WinGet fails only as **SYSTEM** (works for users) | Deploy **[Winget-SystemContext](https://github.com/Barg0/Intune-Platform-Scripts/tree/main/Winget-SystemContext)**; see [WinGet in SYSTEM context](#-winget-in-system-context-platform-script). |
 | 📦 **Collect diagnostics** missing these logs | Deploy **[Diagnostics - Custom Log File Directory](https://github.com/Barg0/Intune-Platform-Scripts/tree/main/Diagnostics%20-%20Custom%20Log%20File%20Directory)**; see [Log files & Collect diagnostics](#-log-files--collect-diagnostics). |
