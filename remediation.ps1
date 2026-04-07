@@ -722,7 +722,7 @@ function Update-Application {
 
             [string]$Locale
         )
-        $wingetArgs = @('upgrade', '--id', $AppId, '-e', '--force', '--accept-package-agreements', '--accept-source-agreements', '-h', '--disable-interactivity', '--source', 'winget')
+        $wingetArgs = @('upgrade', '--id', $AppId, '-e', '--force', '--accept-package-agreements', '--accept-source-agreements', '-h', '--disable-interactivity', '--skip-dependencies', '--source', 'winget')
         if (-not [string]::IsNullOrWhiteSpace($Locale)) { $wingetArgs += '--locale', $Locale.Trim() }
         if ($ScopeMode -eq 'Machine') { $wingetArgs += '--scope', 'machine' }
         elseif ($ScopeMode -eq 'User') { $wingetArgs += '--scope', 'user' }
@@ -916,7 +916,7 @@ function Update-Application {
                     if ($iScope -ne 'Machine') { Write-Log "Retry: $($iScope.ToLower()) scope (install)" -Tag "Info" }
 
                     $installArgs = @('install', '--id', $AppId, '-e', '--version', $AvailableVersion, '--force',
-                        '--accept-package-agreements', '--accept-source-agreements', '-h', '--disable-interactivity', '--source', 'winget')
+                        '--accept-package-agreements', '--accept-source-agreements', '-h', '--disable-interactivity', '--skip-dependencies', '--source', 'winget')
                     if ($iScope -eq 'Machine') { $installArgs += '--scope', 'machine' }
                     elseif ($iScope -eq 'User') { $installArgs += '--scope', 'user' }
                     Write-Log "winget $($installArgs -join ' ')" -Tag "Debug"
@@ -949,7 +949,7 @@ function Update-Application {
                     if ($uScope -ne 'Machine') { Write-Log "Retry: $($uScope.ToLower()) scope (uninstall-previous)" -Tag "Info" }
 
                     $uninstPrevArgs = @('upgrade', '--id', $AppId, '-e', '--version', $AvailableVersion, '--force',
-                        '--uninstall-previous', '--accept-package-agreements', '--accept-source-agreements', '-h', '--disable-interactivity', '--source', 'winget')
+                        '--uninstall-previous', '--accept-package-agreements', '--accept-source-agreements', '-h', '--disable-interactivity', '--skip-dependencies', '--source', 'winget')
                     if ($uScope -eq 'Machine') { $uninstPrevArgs += '--scope', 'machine' }
                     elseif ($uScope -eq 'User') { $uninstPrevArgs += '--scope', 'user' }
                     Write-Log "winget $($uninstPrevArgs -join ' ')" -Tag "Debug"

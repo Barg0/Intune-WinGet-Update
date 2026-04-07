@@ -27,7 +27,7 @@ Scheduled **Microsoft Intune** remediations that use **Windows Package Manager (
 ## ✨ What you get
 
 - 🔍 **Detection** — Queries WinGet for upgrades, applies your list rules, exits **non-compliant** when updates remain.  
-- 🔧 **Remediation** — Refreshes sources, walks each pending app through an **upgrade ladder**, optional **locale** retry, optional **`install` fallback** and **`--uninstall-previous`** (each gated by **per-app allowlists**), **`--silent`** plus **`--disable-interactivity`** on WinGet invocations, then logs a **one-line portal summary**.  
+- 🔧 **Remediation** — Refreshes sources, walks each pending app through an **upgrade ladder**, optional **locale** retry, optional **`install` fallback** and **`--uninstall-previous`** (each gated by **per-app allowlists**), **`--silent`**, **`--disable-interactivity`**, and **`--skip-dependencies`** on WinGet invocations, then logs a **one-line portal summary**.  
 - 🎯 **Blacklist or Whitelist** — Wildcards on package IDs (`Mozilla.Firefox*`, …).  
 - ⏳ **Busy installer handling** — Waits and retries when WinGet reports *another installation in progress*.  
 - 📝 **Logs** — `%ProgramData%\IntuneLogs\Scripts\WinGet-Update\` → `detection.log` / `remediation.log`
@@ -177,7 +177,7 @@ C:\ProgramData\IntuneLogs\Scripts\WinGet-Update\
 
 For each **locale pass** (normal, then optional `--locale` workaround):
 
-1. **`winget upgrade`** with **`--scope machine`** (`--source winget`, `-e`, `--force`, **`--accept-package-agreements`**, **`--accept-source-agreements`**, **`-h` / `--silent`**, **`--disable-interactivity`** — see [winget upgrade](https://learn.microsoft.com/windows/package-manager/winget/upgrade)).  
+1. **`winget upgrade`** with **`--scope machine`** (`--source winget`, `-e`, `--force`, **`--accept-package-agreements`**, **`--accept-source-agreements`**, **`-h` / `--silent`**, **`--disable-interactivity`**, **`--skip-dependencies`** — see [winget upgrade](https://learn.microsoft.com/windows/package-manager/winget/upgrade)).  
 2. If WinGet indicates **wrong scope / no package / no applicable** (and not a hard stop), retry **without** `--scope`.  
 3. If still needed, retry with **`--scope user`**.  
 
@@ -206,7 +206,7 @@ If the **`AppId`** matches **`$wingetUninstallPreviousAllowlist`** and **`Availa
 
 ### 🔍 Detection script behavior (no “fallbacks” like remediation)
 
-- Three **`winget upgrade --disable-interactivity --source winget`** list passes: **no scope**, **`--scope user`**, **`--scope machine`**, merged by **App ID**.  
+- Three **`winget upgrade --disable-interactivity --skip-dependencies --source winget`** list passes: **no scope**, **`--scope user`**, **`--scope machine`**, merged by **App ID**.  
 - Rows with **Unknown** version are skipped.  
 - **No** install / uninstall-previous / override logic (those exist only in **remediation**, with allowlists).
 
