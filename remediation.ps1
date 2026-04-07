@@ -462,7 +462,9 @@ function Test-AppMatch {
         [Parameter(Mandatory = $true)]
         [string]$AppId,
 
+        # Empty @() is valid: no patterns → no match. Required for empty blacklist/whitelist/allowlist configs.
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [string[]]$PatternList
     )
 
