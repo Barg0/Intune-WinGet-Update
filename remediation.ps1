@@ -43,28 +43,36 @@ $whitelistApps = @(
 # run the same ladder once more with `winget upgrade ... --locale <this>` (manifest/installer locale). Empty string disables.
 $wingetLocaleWorkaround = 'en-US'
 
+# ---------------------------[ WinGet installer busy ]---------------------------
 # When WinGet returns INSTALL_IN_PROGRESS (0x8A150102 / -1978334974), wait and re-run the same upgrade attempt.
 # Defaults match https://github.com/Barg0/Intune-WinGet/blob/main/templates/install.ps1 ($maxInProgressRetries / $inProgressDelaySeconds).
 $wingetInProgressMaxRetries      = 15
 $wingetInProgressWaitSeconds     = 120
 
+# ---------------------------[ WinGet download retry ]---------------------------
 # When WinGet returns a transient download error (0x8A150008, 0x8A15002E, 0x8A150086), wait this long then retry once.
 $wingetDownloadRetryWaitSeconds  = 30
 
+# ---------------------------[ Install fallback allowlist ]---------------------------
 # When all upgrade attempts fail with 0x8A150014 ("No packages found"), fall back to `winget install --version --force`.
 # The install command resolves against source manifests instead of ARP entries, bypassing the matching bug.
 # Only AppIds matching a pattern here may use this workaround. Wildcards supported (same as blacklist). Empty @() = never.
 # @('*') = allow for every package.
-$wingetInstallFallbackAllowlist = @(
-    # 'Contoso.ExampleApp'
-)
+$wingetInstallFallbackAllowlist = @( 'Nextcloud.Talk' )
 
+# ---------------------------[ Uninstall-previous allowlist ]---------------------------
 # LAST RESORT: `winget upgrade --uninstall-previous`. Uninstalls the existing version before installing the new one.
 # Destructive if uninstall succeeds but install fails. Only AppIds matching a pattern here may use this workaround.
 # Empty @() = never. @('*') = allow for every package.
 $wingetUninstallPreviousAllowlist = @(
     # 'Contoso.ExampleApp'
 )
+
+# ---------------------------[ Scope ladder ]---------------------------
+# Ordered WinGet `--scope` attempts: upgrades, install fallback, and uninstall-previous.
+# Use 'Machine' (--scope machine), 'Default' (omit --scope), 'User' (--scope user).
+# Aliases (case-insensitive): 'system' -> Machine, 'none' -> Default. No duplicate scopes.
+$wingetScopeLadderOrder = @('machine', 'none', 'user')
 
 # ---------------------------[ Script Start Timestamp ]---------------------------
 $scriptStartTime = Get-Date
@@ -685,6 +693,90 @@ function Select-FilteredUpdates {
     return , $filteredUpdates
 }
 
+function Get-WingetScopeLadderOrderNormalized {
+    [CmdletBinding()]
+    param()
+    $rawList = @($wingetScopeLadderOrder)
+    if ($rawList.Count -eq 0) {
+        throw 'wingetScopeLadderOrder must be a non-empty array.'
+    }
+    # Expand each array element: commas and/or spaces become separate tokens so
+    # @('Default Machine User'), @('Machine,Default,User'), or a single mistaken string do not pass one invalid ScopeMode.
+    $tokens = [System.Collections.Generic.List[string]]::new()
+    foreach ($raw in $rawList) {
+        $t = [string]$raw
+        if ([string]::IsNullOrWhiteSpace($t)) { continue }
+        foreach ($commaPart in ($t -split ',')) {
+            $cp = $commaPart.Trim()
+            if ([string]::IsNullOrWhiteSpace($cp)) { continue }
+            foreach ($word in ($cp -split '\s+')) {
+                $w = $word.Trim()
+                if (-not [string]::IsNullOrWhiteSpace($w)) {
+                    [void]$tokens.Add($w)
+                }
+            }
+        }
+    }
+    if ($tokens.Count -eq 0) {
+        throw 'wingetScopeLadderOrder resolved to no tokens (only blank entries?).'
+    }
+
+    $normalized = [System.Collections.Generic.List[string]]::new()
+    $seen = @{}
+    foreach ($key in $tokens) {
+        $mode = switch -Regex ($key.ToLowerInvariant()) {
+            '^(machine|system)$' { 'Machine'; break }
+            '^(default|none)$' { 'Default'; break }
+            '^(user)$' { 'User'; break }
+            default { throw "Invalid wingetScopeLadderOrder token: '$key'. Use Machine, Default, User (or system, none)." }
+        }
+        if ($seen.ContainsKey($mode)) {
+            throw "Duplicate scope in wingetScopeLadderOrder: $mode"
+        }
+        $seen[$mode] = $true
+        [void]$normalized.Add($mode)
+    }
+    # Do not use `return , $array` — the unary comma wraps the array so callers get one nested object;
+    # coercing that to [string] for -ScopeMode becomes "Default Machine User" (joined with spaces).
+    return $normalized.ToArray()
+}
+
+function Get-WingetScopeSuccessSuffix {
+    param(
+        [ValidateSet('Machine', 'Default', 'User')]
+        [string]$ScopeMode
+    )
+    switch ($ScopeMode) {
+        'Machine' { return 'machine' }
+        'Default' { return 'default scope' }
+        'User' { return 'user' }
+    }
+}
+
+function Get-WingetScopeUpgradeRetryLog {
+    param(
+        [ValidateSet('Machine', 'Default', 'User')]
+        [string]$ScopeMode
+    )
+    switch ($ScopeMode) {
+        'Machine' { return 'Retry: --scope machine' }
+        'Default' { return 'Retry: no --scope' }
+        'User' { return 'Retry: --scope user' }
+    }
+}
+
+function Get-WingetScopeShortName {
+    param(
+        [ValidateSet('Machine', 'Default', 'User')]
+        [string]$ScopeMode
+    )
+    switch ($ScopeMode) {
+        'Machine' { return 'machine' }
+        'Default' { return 'default' }
+        'User' { return 'user' }
+    }
+}
+
 # WinGet sometimes prints "No applicable upgrade found" (exit 0 or 0x8A15002B) while `winget upgrade` list still shows a newer version.
 function Test-WingetUpgradeOutputClaimsNoApplicable {
     param(
@@ -697,14 +789,12 @@ function Test-WingetUpgradeOutputClaimsNoApplicable {
 }
 
 # ---------------------------[ Update Application ]---------------------------
-# Upgrade ladder (same spirit as https://github.com/Barg0/Intune-WinGet/blob/main/templates/install.ps1 — machine first, then relax scope):
-#   1. `winget upgrade --scope machine` (+ in-progress wait loop on INSTALL_IN_PROGRESS)
-#   2. If RetryScope, 0x8A15002B, 0x8A150014, or output says no applicable upgrade: retry without `--scope` (WinGet default)
-#   3. If still RetryScope / 0x8A15002B / same output heuristic: retry `--scope user`
-#   4. Success only if exit category Success AND output does not claim no applicable upgrade (guards false exit 0)
-#   5. RetryLater -> $null
-#   6. If locale pass 0 still ends with 0x8A150014 and $wingetLocaleWorkaround is set: repeat steps 1–3 with `--locale`
-#   7. Else Fail -> $false
+# Upgrade ladder: order from $wingetScopeLadderOrder (normalized in main to $script:WingetScopeLadderNormalized).
+#   - First scope always runs; each further scope runs only if prior attempt did not defer and
+#     (Test-ShouldAdvanceScopeLadder) or exit 0x8A150014 (-1978335212).
+#   - Success only if exit category Success AND output does not claim no applicable upgrade (guards false exit 0)
+#   - RetryLater / hash / download -> $null
+#   - Locale pass + source repair unchanged; Get-AvailableUpdates listing order is separate from this ladder.
 function Update-Application {
     [CmdletBinding()]
     param(
@@ -724,7 +814,7 @@ function Update-Application {
 
             [string]$Locale
         )
-        $wingetArgs = @('upgrade', '--id', $AppId, '-e', '--force', '--accept-package-agreements', '--accept-source-agreements', '-h', '--disable-interactivity', '--skip-dependencies', '--source', 'winget')
+        $wingetArgs = @('upgrade', '--id', $AppId, '-e', '--force', '--accept-package-agreements', '--accept-source-agreements', '--silent', '--disable-interactivity', '--skip-dependencies', '--source', 'winget')
         if (-not [string]::IsNullOrWhiteSpace($Locale)) { $wingetArgs += '--locale', $Locale.Trim() }
         if ($ScopeMode -eq 'Machine') { $wingetArgs += '--scope', 'machine' }
         elseif ($ScopeMode -eq 'User') { $wingetArgs += '--scope', 'user' }
@@ -790,6 +880,12 @@ function Update-Application {
     }
 
     try {
+        $scopeOrder = $script:WingetScopeLadderNormalized
+        if ($null -eq $scopeOrder -or @($scopeOrder).Count -eq 0) {
+            throw 'WingetScopeLadderNormalized is not set. Remediation main must call Get-WingetScopeLadderOrderNormalized first.'
+        }
+        $scopeOrder = @($scopeOrder)
+
         $localePassMax = if ([string]::IsNullOrWhiteSpace($wingetLocaleWorkaround)) { 1 } else { 2 }
         $sourceRepairDone = $false
 
@@ -816,37 +912,18 @@ function Update-Application {
                 if ($ladderRun -eq 1)  { $runNotes += 'source repair' }
                 $successNote = if ($runNotes.Count -gt 0) { " ($($runNotes -join ', '))" } else { '' }
 
-                # 1) --scope machine (system-context upgrades; matches Intune-WinGet install.ps1 defaultScope machine)
-                $first = Invoke-UpgradeAttempt -ScopeMode Machine -Locale $localeArg
-                $upgradeOutput = $first.Output
-                $exitCode = $first.ExitCode
+                for ($si = 0; $si -lt $scopeOrder.Count; $si++) {
+                    $scopeMode = $scopeOrder[$si]
 
-                if ($exitCode -eq -1978334974) {
-                    Write-Log "Defer ${AppId}: install busy (max waits)" -Tag "Info"
-                    return $null
-                }
+                    if ($si -gt 0) {
+                        $tryNextScope = (Test-ShouldAdvanceScopeLadder -ExitInfo $exitInfo -ExitCode $exitCode -OutputClaimsNoApplicable $outputClaimsNoApplicable) -or ($exitCode -eq -1978335212)
+                        if (-not $tryNextScope) { break }
+                        Write-Log (Get-WingetScopeUpgradeRetryLog -ScopeMode $scopeMode) -Tag "Info"
+                    }
 
-                $exitInfo = Get-WingetExitCodeInfo -ExitCode $exitCode
-                $outputClaimsNoApplicable = Test-WingetUpgradeOutputClaimsNoApplicable -Lines $upgradeOutput
-                $treatAsSuccess = ($exitInfo.Category -eq 'Success') -and -not $outputClaimsNoApplicable
-
-                if ($treatAsSuccess) {
-                    Write-Log "$AppId (machine)$successNote" -Tag "Success"
-                    return $true
-                }
-
-                if ($exitInfo.Category -in $deferCategories) {
-                    Write-Log "Defer ${AppId}: $($exitInfo.Description)" -Tag "Info"
-                    return $null
-                }
-
-                # 2) no --scope (WinGet default)
-                $tryDefaultScope = (Test-ShouldAdvanceScopeLadder -ExitInfo $exitInfo -ExitCode $exitCode -OutputClaimsNoApplicable $outputClaimsNoApplicable) -or ($exitCode -eq -1978335212)
-                if ($tryDefaultScope) {
-                    Write-Log "Retry: no --scope" -Tag "Info"
-                    $second = Invoke-UpgradeAttempt -ScopeMode Default -Locale $localeArg
-                    $upgradeOutput = $second.Output
-                    $exitCode = $second.ExitCode
+                    $attempt = Invoke-UpgradeAttempt -ScopeMode $scopeMode -Locale $localeArg
+                    $upgradeOutput = $attempt.Output
+                    $exitCode = $attempt.ExitCode
 
                     if ($exitCode -eq -1978334974) {
                         Write-Log "Defer ${AppId}: install busy (max waits)" -Tag "Info"
@@ -858,34 +935,8 @@ function Update-Application {
                     $treatAsSuccess = ($exitInfo.Category -eq 'Success') -and -not $outputClaimsNoApplicable
 
                     if ($treatAsSuccess) {
-                        Write-Log "$AppId (default scope)$successNote" -Tag "Success"
-                        return $true
-                    }
-
-                    if ($exitInfo.Category -in $deferCategories) {
-                        Write-Log "Defer ${AppId}: $($exitInfo.Description)" -Tag "Info"
-                        return $null
-                    }
-                }
-
-                # 3) --scope user
-                $tryUserScope = Test-ShouldAdvanceScopeLadder -ExitInfo $exitInfo -ExitCode $exitCode -OutputClaimsNoApplicable $outputClaimsNoApplicable
-                if ($tryUserScope) {
-                    Write-Log "Retry: --scope user" -Tag "Info"
-                    $third = Invoke-UpgradeAttempt -ScopeMode User -Locale $localeArg
-                    $upgradeOutput = $third.Output
-                    $exitCode = $third.ExitCode
-
-                    if ($exitCode -eq -1978334974) {
-                        Write-Log "Defer ${AppId}: install busy (max waits)" -Tag "Info"
-                        return $null
-                    }
-
-                    $exitInfo = Get-WingetExitCodeInfo -ExitCode $exitCode
-                    $outputClaimsNoApplicable = Test-WingetUpgradeOutputClaimsNoApplicable -Lines $upgradeOutput
-
-                    if (($exitInfo.Category -eq 'Success') -and -not $outputClaimsNoApplicable) {
-                        Write-Log "$AppId (user)$successNote" -Tag "Success"
+                        $suffix = Get-WingetScopeSuccessSuffix -ScopeMode $scopeMode
+                        Write-Log "$AppId ($suffix)$successNote" -Tag "Success"
                         return $true
                     }
 
@@ -894,7 +945,10 @@ function Update-Application {
                         return $null
                     }
 
-                    Write-Log "User scope: exit $exitCode $($exitInfo.Description)" -Tag "Debug"
+                    if ($si -eq ($scopeOrder.Count - 1)) {
+                        $short = Get-WingetScopeShortName -ScopeMode $scopeMode
+                        Write-Log "$short scope: exit $exitCode $($exitInfo.Description)" -Tag "Debug"
+                    }
                 }
 
                 # Source repair: if source-related error and not yet repaired, re-run ladder after repair
@@ -914,13 +968,18 @@ function Update-Application {
             # bypassing the matching bug that causes upgrade to return "No packages found" (winget-cli #5249, #6095).
             if ((Test-AppMatch -AppId $AppId -PatternList @($wingetInstallFallbackAllowlist)) -and $exitCode -eq -1978335212 -and -not [string]::IsNullOrWhiteSpace($AvailableVersion)) {
                 Write-Log "Retry: install fallback (winget install --version $AvailableVersion)" -Tag "Info"
-                foreach ($iScope in @('Machine', 'Default', 'User')) {
-                    if ($iScope -ne 'Machine') { Write-Log "Retry: $($iScope.ToLower()) scope (install)" -Tag "Info" }
+                $installScopeIx = 0
+                foreach ($scopeMode in $scopeOrder) {
+                    if ($installScopeIx -gt 0) {
+                        $sn = Get-WingetScopeShortName -ScopeMode $scopeMode
+                        Write-Log "Retry: ${sn} scope (install)" -Tag "Info"
+                    }
+                    $installScopeIx++
 
                     $installArgs = @('install', '--id', $AppId, '-e', '--version', $AvailableVersion, '--force',
-                        '--accept-package-agreements', '--accept-source-agreements', '-h', '--disable-interactivity', '--skip-dependencies', '--source', 'winget')
-                    if ($iScope -eq 'Machine') { $installArgs += '--scope', 'machine' }
-                    elseif ($iScope -eq 'User') { $installArgs += '--scope', 'user' }
+                        '--accept-package-agreements', '--accept-source-agreements', '--silent', '--disable-interactivity', '--skip-dependencies', '--source', 'winget')
+                    if ($scopeMode -eq 'Machine') { $installArgs += '--scope', 'machine' }
+                    elseif ($scopeMode -eq 'User') { $installArgs += '--scope', 'user' }
                     Write-Log "winget $($installArgs -join ' ')" -Tag "Debug"
                     $upgradeOutput = & $WingetPath @installArgs 2>&1 | Where-Object { $_ -notlike " *" }
                     $exitCode = $LASTEXITCODE
@@ -928,7 +987,8 @@ function Update-Application {
                     $outputClaimsNoApplicable = Test-WingetUpgradeOutputClaimsNoApplicable -Lines $upgradeOutput
 
                     if (($exitInfo.Category -eq 'Success') -and -not $outputClaimsNoApplicable) {
-                        Write-Log "$AppId ($($iScope.ToLower()), install fallback)" -Tag "Success"
+                        $isn = Get-WingetScopeShortName -ScopeMode $scopeMode
+                        Write-Log "$AppId ($isn, install fallback)" -Tag "Success"
                         return $true
                     }
 
@@ -947,13 +1007,18 @@ function Update-Application {
             # Risky: if uninstall succeeds but install fails, the app is gone. Gated by $wingetUninstallPreviousAllowlist.
             if ((Test-AppMatch -AppId $AppId -PatternList @($wingetUninstallPreviousAllowlist)) -and -not [string]::IsNullOrWhiteSpace($AvailableVersion)) {
                 Write-Log "Retry: uninstall-previous" -Tag "Info"
-                foreach ($uScope in @('Machine', 'Default', 'User')) {
-                    if ($uScope -ne 'Machine') { Write-Log "Retry: $($uScope.ToLower()) scope (uninstall-previous)" -Tag "Info" }
+                $uninstScopeIx = 0
+                foreach ($scopeMode in $scopeOrder) {
+                    if ($uninstScopeIx -gt 0) {
+                        $usn = Get-WingetScopeShortName -ScopeMode $scopeMode
+                        Write-Log "Retry: ${usn} scope (uninstall-previous)" -Tag "Info"
+                    }
+                    $uninstScopeIx++
 
                     $uninstPrevArgs = @('upgrade', '--id', $AppId, '-e', '--version', $AvailableVersion, '--force',
-                        '--uninstall-previous', '--accept-package-agreements', '--accept-source-agreements', '-h', '--disable-interactivity', '--skip-dependencies', '--source', 'winget')
-                    if ($uScope -eq 'Machine') { $uninstPrevArgs += '--scope', 'machine' }
-                    elseif ($uScope -eq 'User') { $uninstPrevArgs += '--scope', 'user' }
+                        '--uninstall-previous', '--accept-package-agreements', '--accept-source-agreements', '--silent', '--disable-interactivity', '--skip-dependencies', '--source', 'winget')
+                    if ($scopeMode -eq 'Machine') { $uninstPrevArgs += '--scope', 'machine' }
+                    elseif ($scopeMode -eq 'User') { $uninstPrevArgs += '--scope', 'user' }
                     Write-Log "winget $($uninstPrevArgs -join ' ')" -Tag "Debug"
                     $upgradeOutput = & $WingetPath @uninstPrevArgs 2>&1 | Where-Object { $_ -notlike " *" }
                     $exitCode = $LASTEXITCODE
@@ -961,7 +1026,8 @@ function Update-Application {
                     $outputClaimsNoApplicable = Test-WingetUpgradeOutputClaimsNoApplicable -Lines $upgradeOutput
 
                     if (($exitInfo.Category -eq 'Success') -and -not $outputClaimsNoApplicable) {
-                        Write-Log "$AppId ($($uScope.ToLower()), uninstall-previous)" -Tag "Success"
+                        $usn2 = Get-WingetScopeShortName -ScopeMode $scopeMode
+                        Write-Log "$AppId ($usn2, uninstall-previous)" -Tag "Success"
                         return $true
                     }
 
@@ -999,6 +1065,30 @@ try {
     if (-not (Test-Winget)) {
         Write-Log "Winget unavailable." -Tag "Error"
         Complete-Script -ExitCode 1 -PortalSummaryLine 'Updated: (none) | Failed: (none) | Winget unavailable'
+    }
+
+    try {
+        $nl = Get-WingetScopeLadderOrderNormalized
+        $scopeFlat = [System.Collections.Generic.List[string]]::new()
+        foreach ($o in @($nl)) {
+            if ($null -eq $o) { continue }
+            if ($o -is [string]) {
+                [void]$scopeFlat.Add($o)
+            }
+            elseif ($o -is [System.Array]) {
+                foreach ($x in $o) {
+                    if ($null -ne $x) { [void]$scopeFlat.Add([string]$x) }
+                }
+            }
+            else {
+                [void]$scopeFlat.Add([string]$o)
+            }
+        }
+        $script:WingetScopeLadderNormalized = $scopeFlat.ToArray()
+    }
+    catch {
+        Write-Log "Invalid wingetScopeLadderOrder: $_" -Tag "Error"
+        Complete-Script -ExitCode 1 -PortalSummaryLine 'Updated: (none) | Failed: (none) | Invalid scope ladder config'
     }
 
     # One-time source refresh before we start
