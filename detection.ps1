@@ -3,30 +3,32 @@
 $listMode = 'Blacklist'
 
 $blacklistApps = @(
+    '3CX.PhoneSystem',
+    '3CX.Softphone',
+    'Adobe.Acrobat.Pro',
+    'Adobe.Acrobat.Reader.32-bit',
+    'Adobe.Acrobat.Reader.64-bit',
+    'Adobe.CreativeCloud',
+    'Brave.Brave*',
+    'dotPDN.PaintDotNet',
+    'Fortinet.FortiClientVPN',
+    'Lenovo.SUHelper',
+    'Microsoft.AdministrativeTemplates',
+    'Microsoft.AppInstaller',
     'Microsoft.Edge*',
-    'Microsoft.Teams*',
+    'Microsoft.GlobalSecureAccessClient',
     'Microsoft.Office',
     'Microsoft.OneDrive',
-    'Microsoft.AppInstaller',
+    'Microsoft.PowerShell',
     'Microsoft.RemoteDesktopClient',
-    'Microsoft.GlobalSecureAccessClient',
+    'Microsoft.SurfaceApp',
+    'Microsoft.Teams*',
     'Microsoft.VCLibs.*',
-    'Microsoft.AdministrativeTemplates',
-    '3CX.Softphone',
-    'TrackerSoftware.PDF-XChange*',
-    'Fortinet.FortiClientVPN',
+    'Microsoft.WindowsTerminal',
     'Mozilla.Firefox*',
     'Opera.Opera*',
     'TeamViewer.TeamViewer*',
-    'Brave.Brave*',
-    'Microsoft.WindowsTerminal',
-    'Adobe.Acrobat.Pro',
-    'Adobe.CreativeCloud',
-    'Adobe.Acrobat.Reader.32-bit',
-    'Adobe.Acrobat.Reader.64-bit',
-    'Microsoft.PowerShell',
-    'dotPDN.PaintDotNet',
-    'Lenovo.SUHelper'
+    'TrackerSoftware.PDF-XChange*'
 )
 
 $whitelistApps = @(
