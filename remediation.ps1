@@ -26,6 +26,7 @@ $blacklistApps = @(
     'Adobe.Acrobat.Reader.32-bit',
     'Adobe.Acrobat.Reader.64-bit',
     'Microsoft.PowerShell',
+    'dotPDN.PaintDotNet',
     'Lenovo.SUHelper'
 )
 
