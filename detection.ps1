@@ -524,7 +524,7 @@ try {
 
     Write-Log "Available:" -Tag "Info"
     foreach ($update in $filteredUpdates) {
-        Write-Log (Format-AvailableUpdateSummaryLine -Update $update) -Tag "Info"
+        Write-Log "  $(Format-AvailableUpdateSummaryLine -Update $update)" -Tag "Info"
     }
 
     Write-Log "Detect: $($filteredUpdates.Count) non-compliant" -Tag "Success"
