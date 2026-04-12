@@ -114,15 +114,31 @@ function Write-Log {
     Write-Host "$message"
 }
 
-# One-line summary for Intune portal (last console line). Not written to the log file.
+function Format-AvailableUpdateSummaryLine {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Update
+    )
+    return "$($Update.AppId) $($Update.CurrentVersion) -> $($Update.AvailableVersion)"
+}
+
+# Multiline summary for Intune portal (final console output). Not written to the log file.
 function Build-DetectionPortalSummaryLine {
     param(
-        [string[]]$AppIds = @(),
-
+        [object[]]$Updates = @(),
         [string]$Note = ''
     )
-    $list = if (@($AppIds).Count -gt 0) { @($AppIds) -join ', ' } else { '(none)' }
-    $line = "Available: $list"
+    $arr = @($Updates)
+    if ($arr.Count -gt 0) {
+        $lines = @('Available:') + ($arr | ForEach-Object { Format-AvailableUpdateSummaryLine -Update $_ })
+        $result = $lines -join [Environment]::NewLine
+        if (-not [string]::IsNullOrWhiteSpace($Note)) {
+            $result += [Environment]::NewLine + '| ' + $Note
+        }
+        return $result
+    }
+
+    $line = 'Available: (none)'
     if (-not [string]::IsNullOrWhiteSpace($Note)) {
         $line += " | $Note"
     }
@@ -508,17 +524,11 @@ try {
 
     Write-Log "Available:" -Tag "Info"
     foreach ($update in $filteredUpdates) {
-        $scopeTag = switch ($update.Scope) {
-            'user' { ' [user]' }
-            'machine' { ' [machine]' }
-            default { '' }
-        }
-        Write-Log "  $($update.AppId) $($update.CurrentVersion) -> $($update.AvailableVersion)$scopeTag" -Tag "Info"
+        Write-Log (Format-AvailableUpdateSummaryLine -Update $update) -Tag "Info"
     }
 
     Write-Log "Detect: $($filteredUpdates.Count) non-compliant" -Tag "Success"
-    $pendingIds = foreach ($u in $filteredUpdates) { $u.AppId }
-    Complete-Script -ExitCode 1 -PortalSummaryLine (Build-DetectionPortalSummaryLine -AppIds $pendingIds)
+    Complete-Script -ExitCode 1 -PortalSummaryLine (Build-DetectionPortalSummaryLine -Updates $filteredUpdates)
 }
 catch {
     Write-Log "Unhandled: $_" -Tag "Error"
