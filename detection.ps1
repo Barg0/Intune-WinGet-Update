@@ -122,7 +122,7 @@ function Format-AvailableUpdateSummaryLine {
     return "$($Update.AppId) $($Update.CurrentVersion) -> $($Update.AvailableVersion)"
 }
 
-# Multiline summary for Intune portal (final console output). Not written to the log file.
+# Single-line summary for Intune portal (final console output; portal shows last line only). Not written to the log file.
 function Build-DetectionPortalSummaryLine {
     param(
         [object[]]$Updates = @(),
@@ -130,12 +130,12 @@ function Build-DetectionPortalSummaryLine {
     )
     $arr = @($Updates)
     if ($arr.Count -gt 0) {
-        $lines = @('Available:') + ($arr | ForEach-Object { Format-AvailableUpdateSummaryLine -Update $_ })
-        $result = $lines -join [Environment]::NewLine
+        $parts = $arr | ForEach-Object { Format-AvailableUpdateSummaryLine -Update $_ }
+        $line = 'Available: ' + ($parts -join '; ')
         if (-not [string]::IsNullOrWhiteSpace($Note)) {
-            $result += [Environment]::NewLine + '| ' + $Note
+            $line += " | $Note"
         }
-        return $result
+        return $line
     }
 
     $line = 'Available: (none)'
