@@ -13,6 +13,7 @@ $blacklistApps = @(
     'Brave.Brave*',
     'dotPDN.PaintDotNet',
     'Fortinet.FortiClientVPN',
+    'LANCOM.TrustedAccessClient',
     'Lenovo.SUHelper',
     'Microsoft.AdministrativeTemplates',
     'Microsoft.AppInstaller',
